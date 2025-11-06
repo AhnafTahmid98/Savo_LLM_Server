@@ -1,0 +1,61 @@
+# --- Python build/cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.build/
+build/
+dist/
+.eggs/
+.mypy_cache/
+.pytype/
+.ruff_cache/
+.pytest_cache/
+.cache/
+
+# --- Environments ---
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+pip-wheel-metadata/
+
+# --- Editors/OS junk ---
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# --- Logs & runtime files ---
+logs/
+*.log
+
+# --- Coverage & test artifacts ---
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+pytestdebug.log
+
+# --- Docker ---
+docker-data/
+*~lock.json
+
+# --- App data (keep static locations; ignore runtime snapshots) ---
+map_data/
+!map_data/known_locations.json
+# Optional: keep empty dir in Git
+map_data/.gitkeep
+
+# --- Node (if you add a tiny UI later) ---
+node_modules/
+npm-debug.log*
+yarn-error.log
+
+# --- Misc ---
+.python-version
