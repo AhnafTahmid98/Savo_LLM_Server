@@ -414,3 +414,33 @@ def classify_intent_debug(user_text: str) -> dict:
         "is_nav_intent": is_nav_intent(intent),
         "priority_rule": "STOP > FOLLOW > NAVIGATE > STATUS > CHATBOT",
     }
+
+if __name__ == "__main__":
+    """
+    Minimal manual self-test.
+
+    Run from project root:
+
+        cd ~/robot_savo_LLM/llm_server
+        source .venv/bin/activate
+        python3 -m app.core.intent
+    """
+    samples = [
+        "stop please",
+        "can you follow me",
+        "can you take me to A201",
+        "i want to go to the info desk please",
+        "why did you stop",
+        "hello robot savo, how are you",
+        "",
+    ]
+
+    print("Robot Savo — intent.py self-test\n")
+    for text in samples:
+        info = classify_intent_debug(text)
+        print(f"Text     : {text!r}")
+        print(f"Intent   : {info['intent']}")
+        print(f"Nav goal : {info['nav_goal_guess']!r}")
+        print(f"is_nav   : {info['is_nav_intent']}")
+        print(f"Norm     : {info['normalized']!r}")
+        print("-" * 60)

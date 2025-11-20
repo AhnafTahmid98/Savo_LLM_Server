@@ -1,0 +1,125 @@
+# app/models/chat_response.py
+# -*- coding: utf-8 -*-
+"""
+Robot Savo LLM Server — ChatResponse model
+------------------------------------------
+Defines the response payload schema for the /chat endpoint.
+
+Every tier (online, local, tier3) and the main pipeline MUST return data
+that fits this model so that Robot Savo can:
+- speak reply_text,
+- understand the intent,
+- optionally use nav_goal for navigation.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import Optional
+
+from pydantic import BaseModel, Field, constr
+
+
+class IntentType(str, Enum):
+    """
+    High-level intent decided by the LLM pipeline.
+
+    These must match the intent names used in:
+    - core/intent.py
+    - prompts/*.txt
+    - ROS messages on the robot side
+    """
+
+    NAVIGATE = "NAVIGATE"
+    FOLLOW = "FOLLOW"
+    STOP = "STOP"
+    STATUS = "STATUS"
+    CHATBOT = "CHATBOT"
+
+
+class ChatResponse(BaseModel):
+    """
+    Canonical response body for /chat.
+
+    Fields
+    ------
+    reply_text:
+        Short B1-level sentence Robot Savo will speak to the user.
+        This is already "final text", not a prompt.
+    intent:
+        One of NAVIGATE / FOLLOW / STOP / STATUS / CHATBOT.
+        Robot Savo uses this to decide what mode to act in.
+    nav_goal:
+        Canonical location name when intent is navigation-related
+        (e.g. "A201", "Info Desk"). Null if not applicable.
+    """
+
+    reply_text: constr(min_length=1, strip_whitespace=True) = Field(
+        ...,
+        description="Final B1-level sentence Robot Savo will say aloud.",
+    )
+    intent: IntentType = Field(
+        ...,
+        description="High-level intent: NAVIGATE, FOLLOW, STOP, STATUS, or CHATBOT.",
+    )
+    nav_goal: Optional[str] = Field(
+        default=None,
+        description=(
+            "Canonical navigation target when intent is NAVIGATE/FOLLOW/STOP/STATUS. "
+            "Null when not navigation-related."
+        ),
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "reply_text": "Hello, I am Robot Savo. How can I help you?",
+                    "intent": "CHATBOT",
+                    "nav_goal": None,
+                },
+                {
+                    "reply_text": "Okay, I will guide you to the info desk. Please follow me.",
+                    "intent": "NAVIGATE",
+                    "nav_goal": "Info Desk",
+                },
+            ]
+        }
+    }
+
+
+if __name__ == "__main__":
+    # Minimal self-test so you can quickly verify the model works.
+    print("Robot Savo — ChatResponse self-test")
+
+    chatbot_example = ChatResponse(
+        reply_text="Hello, I am Robot Savo. How can I help you?",
+        intent=IntentType.CHATBOT,
+        nav_goal=None,
+    )
+
+    navigate_example = ChatResponse(
+        reply_text="Okay, I will guide you to the info desk. Please follow me.",
+        intent=IntentType.NAVIGATE,
+        nav_goal="Info Desk",
+    )
+
+    print("\nPython representation (CHATBOT):")
+    print(chatbot_example)
+
+    print("\nPython representation (NAVIGATE):")
+    print(navigate_example)
+
+    print("\nAs JSON (CHATBOT):")
+    try:
+        # Pydantic v2
+        print(chatbot_example.model_dump_json(indent=2))
+    except AttributeError:
+        # Pydantic v1 fallback
+        print(chatbot_example.json(indent=2))
+
+    print("\nAs JSON (NAVIGATE):")
+    try:
+        print(navigate_example.model_dump_json(indent=2))
+    except AttributeError:
+        print(navigate_example.json(indent=2))
