@@ -8,8 +8,10 @@ Central configuration for the LLM server, including:
 - app metadata
 - API host/port
 - filesystem paths (prompts, map_data, logs)
-- Tier1 (online), Tier2 (local), Tier3 (templates) settings
-- basic safety limits
+- Tier1 (online via OpenRouter),
+- Tier2 (local via Ollama HTTP),
+- Tier3 (template fallback),
+- basic safety limits.
 
 """
 
@@ -67,15 +69,15 @@ class Settings(BaseSettings):
     logs_dir: Path = LOGS_DIR
 
     # --- Tier toggles -------------------------------------------------------
-    tier1_enabled: bool = True   # Online LLM (OpenRouter, etc.)
-    tier2_enabled: bool = True   # Local GGUF LLM
+    tier1_enabled: bool = True   # Online LLM (OpenRouter)
+    tier2_enabled: bool = True   # Local LLM (Ollama HTTP)
     tier3_enabled: bool = True   # Template fallback
 
-    # --- Tier1: Online provider (e.g. OpenRouter) --------------------------
+    # --- Tier1: Online provider (OpenRouter) -------------------------------
     tier1_provider: Literal["openrouter"] = "openrouter"
     tier1_base_url: str = "https://openrouter.ai/api/v1/chat/completions"
 
-    # ENV: TIER1_API_KEY=sk-...
+    # ENV: TIER1_API_KEY=sk-or-v1-...
     tier1_api_key: str | None = Field(
         default=None,
         description="API key for Tier1 online provider (env: TIER1_API_KEY).",
@@ -89,14 +91,34 @@ class Settings(BaseSettings):
         "deepseek/deepseek-chat-v3-0324:free",
     ]
 
+    # Timeout (seconds) for Tier1 HTTP calls
     tier1_timeout_s: float = 18.0
 
-    # --- Tier2: Local GGUF LLM (llama-cpp, etc.) ---------------------------
-    tier2_model_path: str = "./models/local/chat-model.gguf"
-    tier2_n_ctx: int = 4096
+    # --- Tier2: Local backend (Ollama HTTP) --------------------------------
+    #
+    # For Robot Savo right now, Tier2 is Ollama running on the PC/Mac.
+    # Configuration comes from:
+    #   TIER2_OLLAMA_URL   (e.g. http://localhost:11434/api/chat)
+    #   TIER2_OLLAMA_MODEL (e.g. llama3.2:latest)
+    #
+    tier2_ollama_url: str | None = Field(
+        default=None,
+        description=(
+            "Ollama chat endpoint, e.g. http://localhost:11434/api/chat "
+            "(env: TIER2_OLLAMA_URL)."
+        ),
+    )
+    tier2_ollama_model: str | None = Field(
+        default=None,
+        description=(
+            "Ollama model name (env: TIER2_OLLAMA_MODEL), "
+            "e.g. llama3.2:latest."
+        ),
+    )
+
+    # Optional generation parameters for Tier2 (used by providers.tier2_local)
     tier2_temperature: float = 0.7
     tier2_max_tokens: int = 512
-    tier2_gpu_layers: int = 0  # 0 = CPU only, >0 = use GPU if available
 
     # --- Tier3: Template-based fallback ------------------------------------
     tier3_language: str = "en"
@@ -121,5 +143,6 @@ if __name__ == "__main__":
     print(f"Environment : {settings.environment}")
     print(f"Tier1 enabled: {settings.tier1_enabled}, API key set: {bool(settings.tier1_api_key)}")
     print(f"Tier1 models: {getattr(settings, 'tier1_model_candidates', [])}")
-    print(f"Tier2 enabled: {settings.tier2_enabled}, model: {settings.tier2_model_path}")
+    print(f"Tier2 enabled: {settings.tier2_enabled}")
+    print(f"Tier2 Ollama : url={settings.tier2_ollama_url!r}, model={settings.tier2_ollama_model!r}")
     print(f"Tier3 enabled: {settings.tier3_enabled}, language: {settings.tier3_language}")

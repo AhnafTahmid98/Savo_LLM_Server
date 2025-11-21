@@ -12,9 +12,11 @@ This module handles the actual text generation workflow:
 
 - Run the 3-tier chain:
     1) Tier1: Online LLM (OpenRouter, multi-model with priority list)
-    2) Tier2: Local LLM (GGUF via llama-cpp or similar)
-    3) Tier3: Template fallback (fully offline, deterministic)
-    
+    2) Tier2: Local LLM (Ollama / llama-cpp, via providers.tier2_local)
+    3) Tier3: Template fallback (fully offline, via providers.tier3_pi)
+
+It does NOT parse the JSON block from the model — that is handled by
+app/core/pipeline.py, which uses generate_reply_text() as a building block.
 """
 
 from __future__ import annotations
@@ -25,9 +27,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import settings
-from app.core.intent import IntentType
+from app.core.intent import IntentType  # Literal type alias
 from app.models.chat_request import ChatRequest
 from app.providers.tier1_online import call_tier1_model, Tier1Error
+from app.providers.tier2_local import call_tier2_model, Tier2Error
+from app.providers.tier3_pi import call_tier3_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -127,77 +131,7 @@ def _build_user_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Tier2: Local LLM (GGUF / llama-cpp)
-# ---------------------------------------------------------------------------
-
-class Tier2Error(Exception):
-    """Raised when Tier2 (local) fails in a recoverable way."""
-
-
-def _call_tier2_local(messages: List[Dict[str, str]]) -> str:
-    """
-    Call Tier2 local model.
-
-    This is a placeholder implementation that you can wire to llama-cpp,
-    Ollama, or any other local model backend.
-
-    For now, it raises Tier2Error so the caller falls back to Tier3.
-    """
-    if not settings.tier2_enabled:
-        raise Tier2Error("Tier2 is disabled in config.")
-
-    # TODO: integrate with your chosen local backend:
-    # - llama-cpp-python
-    # - vLLM
-    # - Ollama HTTP API
-    #
-    # For now, we raise an error so the caller falls back to Tier3.
-    raise Tier2Error("Tier2 local model is not implemented yet.")
-
-
-# ---------------------------------------------------------------------------
-# Tier3: Template fallback
-# ---------------------------------------------------------------------------
-
-def _call_tier3_templates(
-    request: ChatRequest,
-    intent: IntentType,
-    nav_goal_guess: Optional[str] = None,
-) -> str:
-    """
-    Simple, fully offline fallback generator using templates.
-
-    This is guaranteed to succeed and must be safe in all cases.
-    Returns short B1 English sentences.
-    """
-    text = (request.user_text or "").strip()
-
-    if intent == "STOP":
-        return "Okay, I stop here and wait."
-
-    if intent == "FOLLOW":
-        return "Okay, I follow you. Please walk in front of me slowly."
-
-    if intent == "NAVIGATE":
-        if nav_goal_guess:
-            return f"Okay, I will guide you to {nav_goal_guess}. Please follow me."
-        else:
-            return "I can guide you in the building. Please tell me the room or place name."
-
-    if intent == "STATUS":
-        return (
-            "I am Robot Savo, a guide robot. Right now I am just waiting here and ready to help."
-        )
-
-    # CHATBOT or anything else
-    if text:
-        return f"You said: {text}. I am Robot Savo, how can I help you more?"
-    else:
-        return "Hello, I am Robot Savo. How can I help you?"
-
-
-# ---------------------------------------------------------------------------
-# Public API
+# Public API (text only)
 # ---------------------------------------------------------------------------
 
 def generate_reply_text(
@@ -213,16 +147,14 @@ def generate_reply_text(
     request:
         ChatRequest from the /chat endpoint.
     intent:
-        High-level intent decided by our deterministic classifier
-        (STOP / FOLLOW / NAVIGATE / STATUS / CHATBOT).
+        High-level intent (STOP / FOLLOW / NAVIGATE / STATUS / CHATBOT).
     nav_goal_guess:
         Optional raw goal phrase extracted from the text (e.g. "a201", "info desk").
-        This is not yet validated against known_locations.json.
 
     Returns
     -------
     (reply_text, used_tier)
-        reply_text: final B1-English sentence for TTS.
+        reply_text: raw model text (may include JSON block at the end).
         used_tier:  "tier1:<model>" | "tier2" | "tier3"
     """
     # 1) Build messages for LLM-style APIs
@@ -253,13 +185,13 @@ def generate_reply_text(
     # 3) Try Tier2 (local) if enabled
     if settings.tier2_enabled:
         try:
-            reply = _call_tier2_local(messages)
+            reply = call_tier2_model(messages)
             return reply, "tier2"
         except Tier2Error as exc:
             logger.warning("Tier2 failed: %s", exc)
 
     # 4) Fallback to Tier3 templates (must never fail)
-    reply = _call_tier3_templates(request, intent, nav_goal_guess)
+    reply = call_tier3_fallback(request, intent, nav_goal_guess)
     return reply, "tier3"
 
 
@@ -292,7 +224,7 @@ if __name__ == "__main__":
     reply_text, used_tier = generate_reply_text(
         req,
         intent="NAVIGATE",
-        nav_goal_guess="info desk",
+        nav_goal_guess="Info Desk",
     )
 
     print(f"Used tier : {used_tier}")
