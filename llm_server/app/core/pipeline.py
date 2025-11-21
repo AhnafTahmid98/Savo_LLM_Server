@@ -1,254 +1,197 @@
 # app/core/pipeline.py
 # -*- coding: utf-8 -*-
 """
-Robot Savo LLM Server — Main chat pipeline
-------------------------------------------
-This module glues everything together for a single chat turn:
+Robot Savo LLM Server — Pipeline
+--------------------------------
+High-level orchestration for one chat turn.
 
-1) Take a ChatRequest from the Pi (user text, source, meta...).
-2) Classify the intent using our deterministic intent.py:
-       STOP / FOLLOW / NAVIGATE / STATUS / CHATBOT
-3) (Optional) Extract a raw navigation goal phrase (e.g. "a201",
-   "info desk") from the text.
-4) Load any live context (nav_state, robot_status, known_locations)
-   from JSON files under app/map_data/.
-5) Call the generation core (generate_reply_text), which will:
-       - Build prompts based on intent + text
-       - Run Tier1 → Tier2 → Tier3
-       - Return the raw model output text + which tier was used
-6) Try to parse the final JSON block from the model output
-   (as required by our prompts: {"reply_text": "...", "intent": "...", "nav_goal": ...})
-7) Build and return a ChatResponse Pydantic model, which is what
-   FastAPI /chat will send back to the Pi.
-
-IMPORTANT SAFETY DECISION:
-- We treat the deterministic classifier (intent.py) as the source of truth
-  for INTENT. The model's JSON "intent" field is *not* allowed to override it.
-- For navigation goals we currently trust our simple extractor and any
-  later map-lookup, not the model. Model nav_goal in JSON is ignored
-  for now (we may use it for debugging in the future).
+Flow:
+  ChatRequest ->
+    1) classify_intent()        (STOP/FOLLOW/NAVIGATE/STATUS/CHATBOT)
+    2) extract_nav_goal()       (heuristic nav goal, e.g. "A201")
+    3) generate_reply_text()    (Tier1/Tier2/Tier3 -> ModelCallResult)
+    4) parse final JSON block   (-> ParsedJsonResult)
+    5) build ChatResponse       (reply_text, intent, nav_goal)
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Union
 
 from app.core.config import settings
-from app.core.intent import (
-    IntentType,
-    classify_intent,
-    classify_intent_debug,
-    extract_nav_goal,
-)
+from app.core.intent import IntentType, classify_intent, extract_nav_goal
 from app.core.generate import generate_reply_text
+from app.core.types import ModelCallResult, ParsedJsonResult, TierLabel
 from app.models.chat_request import ChatRequest
 from app.models.chat_response import ChatResponse
 
 logger = logging.getLogger(__name__)
 
+_INTENT_VALUES = {"STOP", "FOLLOW", "NAVIGATE", "STATUS", "CHATBOT"}
+
 
 # ---------------------------------------------------------------------------
-# Context loading helpers (nav_state, robot_status, known_locations)
+# Helpers
 # ---------------------------------------------------------------------------
 
-def _load_json_file(path: Path) -> Optional[Dict[str, Any]]:
+def _get_text_and_tier(result: Union[ModelCallResult, Dict[str, Any]]) -> tuple[str, TierLabel]:
     """
-    Safely load a JSON file and return dict or None.
+    Small compatibility helper.
 
-    - Logs a debug message if file is missing.
-    - Logs a warning if JSON is invalid.
+    - Preferred: result is ModelCallResult with .text and .used_tier.
+    - Legacy/defensive: result may be a dict with 'text' and 'used_tier' keys.
     """
-    if not path.is_file():
-        logger.debug("Context file not found (ok for now): %s", path)
-        return None
+    if hasattr(result, "text") and hasattr(result, "used_tier"):
+        return result.text, result.used_tier  # type: ignore[attr-defined]
+    if isinstance(result, dict):
+        text = str(result.get("text", ""))
+        tier = result.get("used_tier", "tier3")
+        return text, tier  # type: ignore[return-value]
+    raise TypeError(f"Unsupported ModelCallResult type: {type(result)!r}")
+
+
+def _fallback_reply_text(raw_text: str) -> str:
+    """
+    Last-resort spoken reply if JSON is missing or broken.
+    """
+    text = (raw_text or "").strip()
+    if not text:
+        return "Hello, I am Robot Savo. How can I help you?"
+    max_chars = getattr(settings, "max_reply_chars", 512)
+    return text[:max_chars]
+
+
+def _parse_model_output(
+    result: Union[ModelCallResult, Dict[str, Any]],
+    default_intent: IntentType,
+    default_nav_goal: Optional[str],
+) -> ParsedJsonResult:
+    """
+    Parse the final JSON block from the model output.
+
+    Expected format (last line / last block):
+      {
+        "reply_text": "...",
+        "intent": "NAVIGATE",
+        "nav_goal": "A201"
+      }
+
+    If anything fails, we fall back to:
+      - reply_text: spoken part or generic fallback
+      - intent    : default_intent
+      - nav_goal  : default_nav_goal
+    """
+    raw_text, used_tier = _get_text_and_tier(result)
+
+    idx = raw_text.rfind("{")
+    if idx == -1:
+        logger.warning("No JSON block found in model output (tier=%s).", used_tier)
+        return ParsedJsonResult(
+            reply_text=_fallback_reply_text(raw_text),
+            intent=default_intent,
+            nav_goal=default_nav_goal,
+            used_tier=used_tier,
+            parse_error="no_json_block",
+        )
+
+    json_part = raw_text[idx:]
+    spoken_part = raw_text[:idx].strip()
 
     try:
-        text = path.read_text(encoding="utf-8")
-        return json.loads(text)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to load JSON from %s: %s", path, exc)
-        return None
+        data = json.loads(json_part)
+    except json.JSONDecodeError as exc:
+        logger.warning("JSON decode error from model output (tier=%s): %s", used_tier, exc)
+        return ParsedJsonResult(
+            reply_text=_fallback_reply_text(raw_text),
+            intent=default_intent,
+            nav_goal=default_nav_goal,
+            used_tier=used_tier,
+            parse_error=f"json_decode_error: {exc}",
+        )
 
+    reply_text = data.get("reply_text")
+    intent_str = data.get("intent")
+    nav_goal = data.get("nav_goal", default_nav_goal)
 
-def load_context() -> Dict[str, Any]:
-    """
-    Load optional runtime context from app/map_data/.
+    if not isinstance(reply_text, str) or not reply_text.strip():
+        reply_text = spoken_part or _fallback_reply_text(raw_text)
 
-    Files (all optional):
-        nav_state.json
-        robot_status.json
-        known_locations.json
+    if not isinstance(intent_str, str) or intent_str not in _INTENT_VALUES:
+        logger.warning(
+            "Invalid or missing intent in JSON (%r); falling back to %s",
+            intent_str,
+            default_intent,
+        )
+        intent_value: IntentType = default_intent
+        parse_error = "invalid_or_missing_intent"
+    else:
+        intent_value = intent_str  # type: ignore[assignment]
+        parse_error = None
 
-    Returns a dict:
-        {
-          "nav_state": {...} or None,
-          "robot_status": {...} or None,
-          "known_locations": {...} or None,
-        }
-    """
-    base: Path = settings.map_data_dir
+    if nav_goal is not None and not isinstance(nav_goal, str):
+        nav_goal = str(nav_goal)
 
-    nav_state = _load_json_file(base / "nav_state.json")
-    robot_status = _load_json_file(base / "robot_status.json")
-    known_locations = _load_json_file(base / "known_locations.json")
+    max_chars = getattr(settings, "max_reply_chars", 512)
+    if len(reply_text) > max_chars:
+        reply_text = reply_text[:max_chars].rstrip()
 
-    return {
-        "nav_state": nav_state,
-        "robot_status": robot_status,
-        "known_locations": known_locations,
-    }
-
-
-# ---------------------------------------------------------------------------
-# JSON extraction from model output
-# ---------------------------------------------------------------------------
-
-def _extract_final_json_block(text: str) -> Optional[Dict[str, Any]]:
-    """
-    Try to extract the final JSON object from the model's reply.
-
-    Our prompts instruct the model to end with a JSON object like:
-
-        {
-          "reply_text": "...",
-          "intent": "NAVIGATE",
-          "nav_goal": "Info Desk"
-        }
-
-    But models are not perfect, so we:
-    - Search from the last '{' to the last '}'.
-    - Attempt json.loads(...) on that substring.
-    - Return the decoded dict, or None if parsing fails.
-
-    We DO NOT trust any earlier '{ ... }' in the text, only the last.
-    """
-    if not text or "{" not in text or "}" not in text:
-        return None
-
-    start = text.rfind("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-
-    candidate = text[start : end + 1]
-
-    try:
-        data = json.loads(candidate)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Failed to parse JSON block from model reply: %s", exc)
-        return None
-
-    if not isinstance(data, dict):
-        return None
-
-    return data
-
-
-def _truncate_reply(text: str) -> str:
-    """
-    Enforce the max_reply_chars limit from settings.
-
-    We don't want extremely long replies; this keeps TTS friendly.
-    """
-    max_len = getattr(settings, "max_reply_chars", 512)
-    if len(text) <= max_len:
-        return text
-    return text[:max_len].rstrip() + "..."
+    return ParsedJsonResult(
+        reply_text=reply_text,
+        intent=intent_value,
+        nav_goal=nav_goal,
+        used_tier=used_tier,
+        parse_error=parse_error,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Core pipeline function
+# Public API
 # ---------------------------------------------------------------------------
 
-def run_pipeline(request: ChatRequest) -> ChatResponse:
+def run_pipeline(
+    request: ChatRequest,
+    context: Optional[Dict[str, Any]] = None,
+) -> ChatResponse:
     """
-    Main public entry point for one chat turn.
-
-    Steps:
-        1) Classify intent from request.user_text (deterministic).
-        2) Extract a raw navigation goal guess (if NAVIGATE).
-        3) Load context JSON files (nav_state, robot_status, known_locations).
-        4) Call generate_reply_text() (Tier1 / Tier2 / Tier3 chain).
-        5) Try to parse the final JSON block from the model's reply.
-        6) Construct ChatResponse with:
-             - reply_text (from JSON or from raw text)
-             - intent (ALWAYS from our classifier, for safety)
-             - nav_goal (currently from our extractor, not model)
+    High-level pipeline for one user turn.
     """
-    user_text = request.user_text
+    # 1) Deterministic intent classification
+    intent: IntentType = classify_intent(request.user_text)
 
-    # 1) Classify intent (deterministic, safety-first)
-    intent: IntentType = classify_intent(user_text)
-    debug_info = classify_intent_debug(user_text)
-    logger.debug("Intent debug: %s", debug_info)
-
-    # 2) Extract a rough nav goal phrase if needed
+    # 2) Heuristic nav goal
     nav_goal_guess: Optional[str] = None
     if intent == "NAVIGATE":
-        nav_goal_guess = extract_nav_goal(user_text)
+        nav_goal_guess = extract_nav_goal(request.user_text)
 
-    # 3) Load live context (currently not deeply used; reserved for future use)
-    context = load_context()
-
-    # 4) Call generation core (multi-tier)
-    raw_model_text, used_tier = generate_reply_text(
+    # 3) Call generation chain
+    model_result = generate_reply_text(
         request=request,
         intent=intent,
         nav_goal_guess=nav_goal_guess,
     )
-    logger.info("Generation used tier: %s", used_tier)
 
-    # 5) Try to parse JSON block at the end of the model text
-    raw_model_text = raw_model_text.strip()
-    parsed_json = _extract_final_json_block(raw_model_text)
-
-    # Split "human-readable" part vs JSON block for debugging,
-    # but for now we only need a clean reply_text.
-    reply_text: str
-
-    if parsed_json is not None:
-        # Prefer reply_text from JSON if present, else fall back to the
-        # full raw text (minus any trailing JSON). This allows the model
-        # to slightly shorten / rephrase for speech.
-        json_reply = parsed_json.get("reply_text")
-        if isinstance(json_reply, str) and json_reply.strip():
-            reply_text = json_reply.strip()
-        else:
-            # If no reply_text key, just use the full raw text
-            reply_text = raw_model_text
-    else:
-        # No JSON found → just use raw text
-        reply_text = raw_model_text
-
-    reply_text = _truncate_reply(reply_text)
-
-    # INTENT SAFETY:
-    # We *always* trust our deterministic classifier for the final intent.
-    final_intent_str: str = intent  # "STOP"/"FOLLOW"/...
-
-    # NAV GOAL:
-    # For now, we trust nav_goal_guess from extract_nav_goal. In the future,
-    # we will validate it against known_locations.json. Model's nav_goal in
-    # JSON is ignored for safety.
-    final_nav_goal: Optional[str] = nav_goal_guess
-
-    # Build the ChatResponse Pydantic model
-    response = ChatResponse(
-        reply_text=reply_text,
-        intent=final_intent_str,
-        nav_goal=final_nav_goal,
+    # 4) Parse final JSON block
+    parsed: ParsedJsonResult = _parse_model_output(
+        result=model_result,
+        default_intent=intent,
+        default_nav_goal=nav_goal_guess,
     )
 
-    # Optionally log everything for debugging
+    # 5) Build ChatResponse
+    response = ChatResponse(
+        reply_text=parsed.reply_text,
+        intent=parsed.intent,
+        nav_goal=parsed.nav_goal,
+    )
+
     logger.debug(
-        "Pipeline result: intent=%s nav_goal=%r used_tier=%s reply_text=%r",
-        final_intent_str,
-        final_nav_goal,
-        used_tier,
-        reply_text,
+        "run_pipeline: tier=%s intent=%s nav_goal=%r parse_error=%r",
+        parsed.used_tier,
+        parsed.intent,
+        parsed.nav_goal,
+        parsed.parse_error,
     )
 
     return response
@@ -262,8 +205,6 @@ if __name__ == "__main__":
     """
     Minimal manual self-test.
 
-    Run from project root:
-
         cd ~/robot_savo_LLM/llm_server
         source .venv/bin/activate
         python3 -m app.core.pipeline
@@ -272,7 +213,6 @@ if __name__ == "__main__":
 
     print("Robot Savo — pipeline.py self-test\n")
 
-    # Example request that should trigger NAVIGATE
     req = ChatRequest(
         user_text="Can you take me to the info desk please?",
         source=InputSource.KEYBOARD,
@@ -280,8 +220,7 @@ if __name__ == "__main__":
         meta={"session_id": "demo-pipeline-001"},
     )
 
-    resp = run_pipeline(req)
-
+    resp = run_pipeline(req, context={})
     print("ChatResponse:")
     print(f"  reply_text : {resp.reply_text!r}")
     print(f"  intent     : {resp.intent!r}")
