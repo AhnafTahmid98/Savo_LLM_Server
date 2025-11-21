@@ -11,14 +11,6 @@ Central configuration for the LLM server, including:
 - Tier1 (online), Tier2 (local), Tier3 (templates) settings
 - basic safety limits
 
-Configuration source order (lowest → highest priority):
-1) Defaults in this file
-2) Values from .env (at repo root)
-3) Environment variables (TIER1_API_KEY, etc.)
-
-NOTE:
-- Real secrets go to `.env` (NOT committed).
-- `.env.example` is committed, showing which keys are needed.
 """
 
 from __future__ import annotations
@@ -89,9 +81,13 @@ class Settings(BaseSettings):
         description="API key for Tier1 online provider (env: TIER1_API_KEY).",
     )
 
-    # Reasoning model (first pass) and reply model (second pass)
-    tier1_model_reasoning: str = "deepseek/deepseek-chat"
-    tier1_model_reply: str = "meta-llama/llama-3.3-8b-instruct"
+    # Priority-ordered model list for Tier1 (first → last).
+    # This is what generate.py uses in the Tier1 loop.
+    tier1_model_candidates: list[str] = [
+        "x-ai/grok-4.1-fast:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "deepseek/deepseek-chat-v3-0324:free",
+    ]
 
     tier1_timeout_s: float = 18.0
 
@@ -124,5 +120,6 @@ if __name__ == "__main__":
     print(f"LOGS_DIR    : {settings.logs_dir}")
     print(f"Environment : {settings.environment}")
     print(f"Tier1 enabled: {settings.tier1_enabled}, API key set: {bool(settings.tier1_api_key)}")
+    print(f"Tier1 models: {getattr(settings, 'tier1_model_candidates', [])}")
     print(f"Tier2 enabled: {settings.tier2_enabled}, model: {settings.tier2_model_path}")
     print(f"Tier3 enabled: {settings.tier3_enabled}, language: {settings.tier3_language}")

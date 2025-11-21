@@ -11,34 +11,6 @@ The output is one high-level INTENT string that controls robot behavior:
     - "STATUS"   : User is asking for explanation / status / battery.
     - "CHATBOT"  : Normal talk (default fallback, safe).
 
-CRITICAL DESIGN:
-----------------
-Intent priority is:
-    STOP > FOLLOW > NAVIGATE > STATUS > CHATBOT
-
-Why?
-1. STOP is safety and must override everything.
-2. FOLLOW and NAVIGATE make the robot move.
-3. STATUS does not move the robot, only talks.
-4. CHATBOT is safe fallback and does not move.
-
-So if the user says:
-    "stop and follow me"
-We must return STOP, not FOLLOW.
-
-We also try to extract a possible navigation goal (like "A201", "Info Desk").
-Example:
-    "can you take me to A201"
-→ intent: "NAVIGATE"
-→ nav_goal: "A201"
-
-NOTE:
-- We only do English right now.
-- We DO NOT move the robot from this file.
-  This file only decides *what the user asked for*.
-  The robot still has final safety layer somewhere else.
-
-This file is safe to unit test with pytest.
 """
 
 from typing import Literal, Optional
