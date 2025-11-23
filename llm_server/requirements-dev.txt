@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Dev-only tools
+websockets>=12.0,<13.0

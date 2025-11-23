@@ -1,0 +1,41 @@
+{
+  "A201": {
+    "building": "A",
+    "canonical_name": "A201",
+    "description": "Electronics / IoT lab.",
+    "display_name": "Room A201 (Lab)",
+    "floor": 2,
+    "synonyms": [
+      "room a201",
+      "a201 lab",
+      "a 201"
+    ],
+    "tags": [
+      "lab",
+      "electronics",
+      "iot"
+    ],
+    "type": "ROOM",
+    "x": 12.3,
+    "y": 4.5
+  },
+  "Info Desk": {
+    "building": "Lobby",
+    "canonical_name": "Info Desk",
+    "description": "Main information desk at the lobby entrance.",
+    "display_name": "Information Desk",
+    "floor": 1,
+    "synonyms": [
+      "reception",
+      "info",
+      "information desk"
+    ],
+    "tags": [
+      "info",
+      "help"
+    ],
+    "type": "SERVICE",
+    "x": 2.0,
+    "y": 1.0
+  }
+}

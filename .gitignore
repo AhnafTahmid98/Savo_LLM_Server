@@ -47,10 +47,14 @@ docker-data/
 *~lock.json
 
 # --- App data (keep static locations; ignore runtime snapshots) ---
-map_data/
-!map_data/known_locations.json
-# Optional: keep empty dir in Git
-map_data/.gitkeep
+# All runtime telemetry lives here; we only track known_locations.json.
+app/map_data/
+!app/map_data/known_locations.json
+# Optional: keep directory in Git even if empty
+app/map_data/.gitkeep
+
+# --- Runtime session store (LLM conversation history) ---
+app/runtime_state/sessions.json
 
 # --- Node (if you add a tiny UI later) ---
 node_modules/
