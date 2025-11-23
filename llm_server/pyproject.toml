@@ -1,0 +1,69 @@
+[build-system]
+# Basic build backend so tools like `pip` or `uv` know how to build the project
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robot-savo-llm-server"
+version = "0.1.0"
+description = "Robot Savo LLM server (FastAPI-based, 3-tier LLM pipeline for Robot Savo)."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Ahnaf Tahmid" }
+]
+license = { text = "Proprietary" }
+
+# IMPORTANT:
+# - We keep runtime dependencies in requirements.txt (used by Docker, venv, etc.).
+# - So we do NOT list them here to avoid having two sources of truth.
+dependencies = []
+
+[project.optional-dependencies]
+# Dev-only tools (you can install them with: `pip install -e .[dev]`)
+dev = [
+  "black>=24.0.0",
+  "ruff>=0.6.0",
+  "mypy>=1.10.0",
+  "pytest>=8.0.0",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+skip-string-normalization = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+# Common lint rules for a FastAPI/Pydantic project
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "I",   # import sorting
+  "B",   # bugbear
+  "UP",  # modern Python upgrades
+]
+ignore = [
+  "E203",  # compatible with Black's slicing style
+  "E501",  # line length handled by Black
+]
+
+[tool.ruff.isort]
+known-first-party = ["app"]
+combine-as-imports = true
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+ignore_missing_imports = true
+strict_optional = true
+
+# You can relax strictness later if it becomes annoying.
+# modules in this repo live under the `app` package:
+namespace_packages = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

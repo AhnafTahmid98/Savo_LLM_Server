@@ -30,6 +30,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # This file is: llm_server/app/core/config.py
 APP_DIR: Path = Path(__file__).resolve().parents[1]   # .../llm_server/app
 ROOT_DIR: Path = APP_DIR.parent                       # .../llm_server
+
 PROMPTS_DIR: Path = APP_DIR / "prompts"
 MAP_DATA_DIR: Path = APP_DIR / "map_data"
 LOGS_DIR: Path = ROOT_DIR / "logs"
@@ -39,6 +40,7 @@ LOGS_DIR.mkdir(exist_ok=True)
 # ---------------------------------------------------------------------------
 # Settings model
 # ---------------------------------------------------------------------------
+
 
 class Settings(BaseSettings):
     """
@@ -55,7 +57,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # --- App / server basics ------------------------------------------------
+    # --- App / server basics -----------------------------------------------
     app_name: str = "Robot Savo LLM Server"
     environment: Literal["development", "production", "test"] = "development"
     debug: bool = True
@@ -64,9 +66,16 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     # --- Filesystem paths ---------------------------------------------------
+    # Base directories
     prompts_dir: Path = PROMPTS_DIR
     map_data_dir: Path = MAP_DATA_DIR
     logs_dir: Path = LOGS_DIR
+
+    # Specific map_data files used by prompts + telemetry
+    # These are the canonical locations other modules should use.
+    nav_state_path: Path = MAP_DATA_DIR / "nav_state.json"
+    robot_status_path: Path = MAP_DATA_DIR / "robot_status.json"
+    known_locations_path: Path = MAP_DATA_DIR / "known_locations.json"
 
     # --- Tier toggles -------------------------------------------------------
     tier1_enabled: bool = True   # Online LLM (OpenRouter)
@@ -125,6 +134,8 @@ class Settings(BaseSettings):
     tier3_enable_status_mode: bool = True
 
     # --- Safety / limits ----------------------------------------------------
+    # These are global logical limits; they can be referenced by safety.py
+    # and pipeline.py to clamp outputs and context size.
     max_reply_chars: int = 512       # Hard cap on reply length
     max_history_turns: int = 8       # How many past turns to keep in context
 
@@ -136,13 +147,17 @@ settings = Settings()
 if __name__ == "__main__":
     # Minimal self-test so you can quickly verify config loading.
     print("Robot Savo — Settings self-test")
-    print(f"ROOT_DIR    : {ROOT_DIR}")
-    print(f"PROMPTS_DIR : {settings.prompts_dir}")
-    print(f"MAP_DATA_DIR: {settings.map_data_dir}")
-    print(f"LOGS_DIR    : {settings.logs_dir}")
-    print(f"Environment : {settings.environment}")
-    print(f"Tier1 enabled: {settings.tier1_enabled}, API key set: {bool(settings.tier1_api_key)}")
-    print(f"Tier1 models: {getattr(settings, 'tier1_model_candidates', [])}")
-    print(f"Tier2 enabled: {settings.tier2_enabled}")
-    print(f"Tier2 Ollama : url={settings.tier2_ollama_url!r}, model={settings.tier2_ollama_model!r}")
-    print(f"Tier3 enabled: {settings.tier3_enabled}, language: {settings.tier3_language}")
+    print(f"ROOT_DIR        : {ROOT_DIR}")
+    print(f"APP_DIR         : {APP_DIR}")
+    print(f"PROMPTS_DIR     : {settings.prompts_dir}")
+    print(f"MAP_DATA_DIR    : {settings.map_data_dir}")
+    print(f"LOGS_DIR        : {settings.logs_dir}")
+    print(f"NavState path   : {settings.nav_state_path}")
+    print(f"RobotStatus path: {settings.robot_status_path}")
+    print(f"Locations path  : {settings.known_locations_path}")
+    print(f"Environment     : {settings.environment}")
+    print(f"Tier1 enabled   : {settings.tier1_enabled}, API key set: {bool(settings.tier1_api_key)}")
+    print(f"Tier1 models    : {getattr(settings, 'tier1_model_candidates', [])}")
+    print(f"Tier2 enabled   : {settings.tier2_enabled}")
+    print(f"Tier2 Ollama    : url={settings.tier2_ollama_url!r}, model={settings.tier2_ollama_model!r}")
+    print(f"Tier3 enabled   : {settings.tier3_enabled}, language: {settings.tier3_language}")

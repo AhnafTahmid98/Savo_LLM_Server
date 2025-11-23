@@ -5,11 +5,21 @@ Robot Savo LLM Server — FastAPI application entrypoint
 ------------------------------------------------------
 This file wires everything together:
 
-- Creates the FastAPI app
-- Adds middleware (CORS for dev)
-- Mounts routers (currently: /chat)
-- Exposes a simple /health endpoint for monitoring
-- Provides an ASGI `app` object for uvicorn
+- Sets up central logging (so you see pipeline tier logs in the console).
+- Creates the FastAPI app.
+- Adds middleware (CORS for dev).
+- Mounts routers:
+    * /chat          (HTTP)     → main LLM endpoint for Robot Savo
+    * /map/*         (HTTP)     → Pi pushes NavState / RobotStatus snapshots
+    * /status/*      (HTTP)     → read-only server + robot status views
+    * /ws/chat       (WebSocket)→ dev / console chat (same pipeline as /chat)
+    * /ws/telemetry  (WebSocket)→ fast telemetry channel from Pi
+- Exposes an ASGI `app` object for uvicorn.
+
+Typical run command (dev):
+
+    uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
 """
 
 from __future__ import annotations
@@ -19,11 +29,37 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.routers.chat import router as chat_router
+from app.routers.map import router as map_router
+from app.routers.status import router as status_router
+from app.routers.ws import router as ws_router
+from app.utils import setup_logging, get_logger
+
+
+# ---------------------------------------------------------------------------
+# Global logging config
+# ---------------------------------------------------------------------------
+# We configure logging once here so that:
+# - app.core.pipeline INFO logs (used_tier, backend) are visible.
+# - tools_web, map_lookup, runtime_state, etc. can also log useful messages.
+#
+# setup_logging() honours settings.debug, so in development you get DEBUG,
+# and in production you can keep it quieter.
+# ---------------------------------------------------------------------------
+setup_logging(debug=settings.debug)
+logger = get_logger(__name__)
+logger.info(
+    "Robot Savo LLM server starting (env=%s, tier1_enabled=%s, tier2_enabled=%s, tier3_enabled=%s)",
+    settings.environment,
+    settings.tier1_enabled,
+    settings.tier2_enabled,
+    settings.tier3_enabled,
+)
 
 
 def create_app() -> FastAPI:
     """
     Application factory.
+
     Returns a configured FastAPI instance ready for uvicorn.
     """
     app = FastAPI(
@@ -35,8 +71,9 @@ def create_app() -> FastAPI:
 
     # ------------------------------------------------------------------
     # CORS (mainly useful if you ever call this API from a browser UI)
+    #
     # For Robot Savo + local dev, allowing all origins is fine.
-    # In production you can restrict this list.
+    # In production you can restrict this list to known frontends.
     # ------------------------------------------------------------------
     if settings.environment != "production":
         app.add_middleware(
@@ -48,21 +85,30 @@ def create_app() -> FastAPI:
         )
 
     # ------------------------------------------------------------------
-    # Routers
+    # Routers (HTTP + WebSocket)
     # ------------------------------------------------------------------
-    # Main chat/navigation endpoint
+    # Main chat/navigation endpoint (Pi will call this via HTTP POST /chat)
     app.include_router(chat_router)
 
-    # TODO (later):
-    # from app.routers.ws import router as ws_router
-    # from app.routers.map import router as map_router
-    # from app.routers.status import router as status_router
-    # app.include_router(ws_router)
-    # app.include_router(map_router)
-    # app.include_router(status_router)
+    # Telemetry snapshots via HTTP:
+    #   POST /map/navstate        -> app/map_data/nav_state.json
+    #   POST /map/status          -> app/map_data/robot_status.json
+    #   GET  /map/known_locations -> known_locations table
+    app.include_router(map_router)
+
+    # Read-only status views:
+    #   GET /status/nav
+    #   GET /status/robot
+    #   GET /status/all
+    app.include_router(status_router)
+
+    # WebSocket endpoints:
+    #   /ws/chat       -> dev console / future streaming chat
+    #   /ws/telemetry  -> fast NavState/RobotStatus from Pi
+    app.include_router(ws_router)
 
     # ------------------------------------------------------------------
-    # Health check + root
+    # Meta / health endpoints
     # ------------------------------------------------------------------
 
     @app.get("/", tags=["meta"])
@@ -90,6 +136,7 @@ def create_app() -> FastAPI:
             "tier3_enabled": settings.tier3_enabled,
         }
 
+    logger.info("FastAPI app created (env=%s)", settings.environment)
     return app
 
 
@@ -98,12 +145,18 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    # Allow `python3 app/main.py` during development.
+    """
+    Allow `python3 -m app.main` during development.
+
+    In production you normally use:
+
+        uvicorn app.main:app --host 0.0.0.0 --port 8000
+    """
     import uvicorn
 
     uvicorn.run(
         "app.main:app",
         host=settings.api_host,
         port=settings.api_port,
-        reload=True,       # auto-reload on code changes (dev only)
+        reload=(settings.environment != "production"),  # auto-reload only in non-prod
     )

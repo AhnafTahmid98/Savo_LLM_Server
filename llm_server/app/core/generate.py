@@ -10,6 +10,7 @@ This module handles the actual text generation workflow:
     - user text (ChatRequest)
     - optional navigation goal guess
     - optional META payload (live data, nav_state, etc.) in request.meta
+    - optional conversation history (from runtime_state)
 
 - Run the 3-tier chain:
     1) Tier1: Online LLM (OpenRouter, multi-model with priority list)
@@ -74,9 +75,12 @@ def _build_system_prompt(intent: IntentType) -> str:
     base = _read_prompt_file("system_prompt.txt")
     style = _read_prompt_file("style_guidelines.txt")
 
-    if intent in ("NAVIGATE", "FOLLOW", "STOP"):
+    # Accept both Enum and plain string for intent.
+    intent_str = str(intent)
+
+    if intent_str in ("NAVIGATE", "FOLLOW", "STOP"):
         mode = _read_prompt_file("navigation_prompt.txt")
-    elif intent == "STATUS":
+    elif intent_str == "STATUS":
         mode = _read_prompt_file("status_prompt.txt")
     else:
         # CHATBOT (and any unknown → safe default)
@@ -107,9 +111,11 @@ def _build_user_prompt(
     - any guessed navigation goal
     - optional source / language / meta (live data etc.)
     """
+    intent_str = str(intent)
+
     lines: List[str] = [
         f"USER_TEXT: {request.user_text}",
-        f"INTENT_HINT: {intent}",
+        f"INTENT_HINT: {intent_str}",
     ]
     if nav_goal_guess:
         lines.append(f"NAV_GOAL_GUESS: {nav_goal_guess}")
@@ -129,6 +135,55 @@ def _build_user_prompt(
             logger.warning("ChatRequest.meta is not JSON-serializable; ignoring.")
 
     return "\n".join(lines)
+
+
+def _inject_conversation_history(
+    messages: List[Dict[str, str]],
+    request: ChatRequest,
+) -> None:
+    """
+    Inject conversation history (if present in request.meta["conversation_history"])
+    as prior messages before the current user prompt.
+
+    Expected format (set by runtime_state.session_store via pipeline):
+
+        request.meta["conversation_history"] = [
+            {"role": "user", "content": "..."},
+            {"role": "assistant", "content": "..."},
+            ...
+        ]
+
+    We are defensive here: if anything looks wrong, we just skip it and
+    keep going, to avoid breaking the generation call.
+    """
+    meta = request.meta or {}
+    history = meta.get("conversation_history")
+    if not history:
+        return
+
+    if not isinstance(history, list):
+        logger.debug(
+            "conversation_history is not a list, ignoring: %r", type(history)
+        )
+        return
+
+    for turn in history:
+        try:
+            if not isinstance(turn, dict):
+                continue
+            role_raw = str(turn.get("role") or "").strip().lower()
+            content = str(turn.get("content") or "").strip()
+            if role_raw not in ("user", "assistant"):
+                continue
+            if not content:
+                continue
+            messages.append({"role": role_raw, "content": content})
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "Skipping invalid conversation_history turn: %r",
+                turn,
+                exc_info=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -159,22 +214,32 @@ def generate_reply_text(
         .used_tier -> "tier1" | "tier2" | "tier3"
         .raw       -> backend metadata (model name, etc.)
     """
-    # 1) Build messages for LLM-style APIs
+    # 1) Build system + user prompts
     system_prompt = _build_system_prompt(intent)
     user_prompt = _build_user_prompt(request, intent, nav_goal_guess)
 
+    # 2) Build messages list for chat-style APIs
+    #    - First the system message
+    #    - Then optional previous conversation history
+    #    - Finally the current user message (with USER_TEXT / META etc.)
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
     ]
 
-    # 2) Try Tier1 (online) with model priority list
+    # Inject history from runtime_state if available
+    _inject_conversation_history(messages, request)
+
+    # Current user turn as the final message
+    messages.append({"role": "user", "content": user_prompt})
+
+    # 3) Try Tier1 (online) with model priority list
     if settings.tier1_enabled and settings.tier1_api_key:
         model_list = getattr(settings, "tier1_model_candidates", None) or []
 
         if not model_list:
             logger.warning(
-                "Tier1 is enabled and API key is set, but no tier1_model_candidates configured; skipping Tier1."
+                "Tier1 is enabled and API key is set, but no "
+                "tier1_model_candidates configured; skipping Tier1."
             )
         else:
             for model_name in model_list:
@@ -188,7 +253,7 @@ def generate_reply_text(
                 except Tier1Error as exc:
                     logger.warning("Tier1 model %s failed: %s", model_name, exc)
 
-    # 3) Try Tier2 (local) if enabled
+    # 4) Try Tier2 (local) if enabled
     if settings.tier2_enabled:
         try:
             reply_text = call_tier2_model(messages)
@@ -200,7 +265,7 @@ def generate_reply_text(
         except Tier2Error as exc:
             logger.warning("Tier2 failed: %s", exc)
 
-    # 4) Fallback to Tier3 templates (must never fail)
+    # 5) Fallback to Tier3 templates (must never fail)
     reply_text = call_tier3_fallback(request, intent, nav_goal_guess)
     return ModelCallResult(
         text=reply_text,
@@ -214,25 +279,26 @@ def generate_reply_text(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    """
-    Minimal manual self-test.
-
-    Run from project root:
-
-        cd ~/robot_savo_LLM/llm_server
-        source .venv/bin/activate
-        python3 -m app.core.generate
-    """
     from app.models.chat_request import InputSource
 
     print("Robot Savo — generate.py self-test\n")
 
-    # Fake request
+    # Fake request with a tiny history (simulating runtime_state)
     req = ChatRequest(
-        user_text="Can you take me to info deskS?",
+        user_text="Can you take me to info desk?",
         source=InputSource.KEYBOARD,
         language="en",
-        meta={"session_id": "demo-001"},
+        session_id="demo-001",
+        meta={
+            "session_id": "demo-001",
+            "conversation_history": [
+                {"role": "user", "content": "Hello Robot Savo."},
+                {
+                    "role": "assistant",
+                    "content": "Hello, I am Robot Savo. How can I help you?",
+                },
+            ],
+        },
     )
 
     result = generate_reply_text(

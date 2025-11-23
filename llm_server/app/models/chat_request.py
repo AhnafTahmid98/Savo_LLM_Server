@@ -8,6 +8,7 @@ Canonical request payload for the /chat endpoint.
 This model is shared by all tiers (online, local, tier3). It carries:
 - the raw user text
 - minimal context about where it came from
+- an explicit session_id for conversation tracking
 - optional metadata for logging / routing
 """
 
@@ -42,8 +43,14 @@ class ChatRequest(BaseModel):
     language:
         BCP-47 language code for the text, e.g. "en", "fi".
         For Robot Savo we mainly use "en" now, but it is future-proof.
+    session_id:
+        Stable identifier for this conversation. The Pi should generate
+        and reuse the same session_id while talking to the same human,
+        and start a new session_id when a new user arrives.
+        If omitted, the pipeline may fall back to a default strategy
+        (e.g. per-connection or one-shot).
     meta:
-        Free-form metadata bag (session_id, client name, debug flags, etc.).
+        Free-form metadata bag (client name, debug flags, environment info).
         This can be used by any tier for logging or routing decisions.
     """
 
@@ -62,11 +69,41 @@ class ChatRequest(BaseModel):
         description="BCP-47 language code of user_text (e.g. 'en', 'fi').",
         example="en",
     )
+    session_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Stable identifier for this conversation/session. "
+            "The Pi should generate and reuse this while talking "
+            "to the same human, and start a new one for a new user."
+        ),
+        example="robot-savo-session-001",
+    )
     meta: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Optional metadata (session_id, client_id, flags, etc.).",
-        example={"session_id": "robot-savo-001", "client": "pi5"},
+        description="Optional metadata (client_id, flags, environment info, etc.).",
+        example={"client": "pi5", "build": "2025-11-23"},
     )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "user_text": "Hello Robot Savo, how are you?",
+                    "source": "mic",
+                    "language": "en",
+                    "session_id": "robot-savo-session-001",
+                    "meta": {"client": "pi5", "env": "lab"},
+                },
+                {
+                    "user_text": "Can you guide me to A201?",
+                    "source": "keyboard",
+                    "language": "en",
+                    "session_id": "dev-session-001",
+                    "meta": {"client": "dev-shell"},
+                },
+            ]
+        }
+    }
 
 
 if __name__ == "__main__":
@@ -77,7 +114,8 @@ if __name__ == "__main__":
         user_text="Hello Robot Savo, how are you?",
         source=InputSource.TEST,
         language="en",
-        meta={"session_id": "demo-001", "client": "dev-shell"},
+        session_id="demo-session-001",
+        meta={"client": "dev-shell", "env": "local"},
     )
 
     print("\nPython representation:")

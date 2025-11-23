@@ -1,245 +1,467 @@
 # app/core/pipeline.py
 # -*- coding: utf-8 -*-
 """
-Robot Savo LLM Server — High-level pipeline
--------------------------------------------
-This module glues everything together for the /chat endpoint:
+Robot Savo — LLM Pipeline
+-------------------------
+High-level pipeline for handling a single /chat request:
 
-1) Takes a ChatRequest from FastAPI.
-2) Classifies intent using our deterministic classifier.
-3) (NEW) Optionally fetches live data (weather, time, crypto) via tools_web
-   and injects it into request.meta["live_context"] so the LLM can use it.
-4) Calls generate_reply_text() to run the Tier1/Tier2/Tier3 chain.
-5) Parses the final JSON block from the model output.
-6) Returns a ChatResponse model (reply_text, intent, nav_goal) for FastAPI.
+    ChatRequest -> (intent + context + prompts) -> generate.py -> ChatResponse
+
+This version:
+- Uses deterministic intent classification (core/intent.py).
+- Uses map_lookup + KnownLocations to get a canonical nav_goal.
+- Loads live telemetry via:
+    - NavState     (nav_state.json)
+    - RobotStatus  (robot_status.json)
+- Attaches a locations summary (known locations).
+- Attaches live web context (weather / time / BTC) via tools_web.
+- Injects all of this into ChatRequest.meta so generate.py can see it.
+- Calls generate.generate_reply_text(...) (3-tier chain).
+- Parses the final JSON block and returns ChatResponse.
+- Tracks per-session conversation history using runtime_state.session_store.
+
+IMPORTANT:
+- For non-navigation intents (CHATBOT, STATUS without movement), nav_goal is
+  forced to None in the final ChatResponse. Only NAVIGATE/FOLLOW may carry
+  a nav_goal (STOP is special but still not a "new" goal).
+- If nav_state.json or robot_status.json do NOT exist yet, we send EMPTY
+  dicts for nav_state / robot_status so the model cannot invent fake
+  battery or temperature from defaults. Prompts must treat empty dict as
+  "no telemetry available".
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from app.core.config import settings
-from app.core.intent import (
-    classify_intent,
-    extract_nav_goal,
-    IntentType,  # Literal type alias ("STOP", "FOLLOW", ...)
-)
-from app.core.types import ModelCallResult, ParsedJsonResult
+from app.core.intent import classify_intent, extract_nav_goal, is_nav_intent
+from app.core import safety
+from app.core.map_lookup import resolve_nav_goal, get_known_locations
 from app.core.generate import generate_reply_text
-from app.core.tools_web import (
-    get_weather_current,
-    get_local_time,
-    get_crypto_price,
-    ToolsWebError,
-)
+from app.core.types import ModelCallResult
+from app.core import tools_web  # live web tools (weather / time / crypto)
 from app.models.chat_request import ChatRequest
-from app.models.chat_response import ChatResponse, IntentType as ResponseIntentType
+from app.models.chat_response import ChatResponse
+from app.models.nav_state_model import NavState
+from app.models.robot_status_model import RobotStatus
+from app.runtime_state import session_store  # session tracking
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Helpers for parsing the model's JSON block
+# Telemetry + locations helpers
 # ---------------------------------------------------------------------------
 
-def _extract_json_suffix(raw_text: str) -> Optional[Dict[str, Any]]:
+
+def _load_nav_state_for_meta() -> Dict[str, Any]:
     """
-    Try to find and parse a JSON object at the end of the model's reply.
+    Load NavState snapshot as JSON dict for meta.
 
-    We search for the last '{' and attempt json.loads() from there.
-    If parsing fails, return None.
+    Behaviour:
+    - If nav_state.json exists and loads: return its JSON.
+    - If nav_state.json is missing: return {} (no fake "idle" state).
+    - If any error occurs: log and return {}.
     """
-    if not raw_text:
-        return None
-
-    idx = raw_text.rfind("{")
-    if idx == -1:
-        return None
-
-    candidate = raw_text[idx:]
     try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        logger.warning("Failed to parse JSON suffix from model output.")
+        nav_state = NavState.load()
+        data = nav_state.to_json_dict()
+        # If the snapshot is completely empty, treat as no telemetry.
+        if not isinstance(data, dict) or not data:
+            return {}
+        return data
+    except FileNotFoundError:
+        logger.info("NavState snapshot missing (no nav_state.json yet).")
+        return {}
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to load NavState; using empty dict.")
+        return {}
+
+
+def _load_robot_status_for_meta() -> Dict[str, Any]:
+    """
+    Load RobotStatus snapshot as JSON dict for meta.
+
+    Behaviour:
+    - If robot_status.json exists and loads: return its JSON.
+    - If robot_status.json is missing: return {} (NO default/fake values).
+    - If any error occurs: log and return {}.
+
+    This is important so that the model only sees *real* battery/temperature
+    when the Pi has actually pushed telemetry.
+    """
+    try:
+        status = RobotStatus.load()
+        data = status.to_json_dict()
+        if not isinstance(data, dict) or not data:
+            return {}
+        return data
+    except FileNotFoundError:
+        logger.info("RobotStatus snapshot missing (no robot_status.json yet).")
+        return {}
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to load RobotStatus; using empty dict.")
+        return {}
+
+
+def _build_locations_summary() -> str:
+    """
+    Build a short textual summary of known locations.
+
+    Example:
+        "Known locations: A201 (Room A201 (Lab)), Info Desk (Information Desk)"
+    """
+    try:
+        known = get_known_locations()
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to load known locations; using empty summary.")
+        return ""
+
+    names = known.list_canonical_names()
+    if not names:
+        return ""
+
+    parts: List[str] = []
+    for key in names:
+        loc = known.get(key)
+        if not loc:
+            continue
+        parts.append(f"{key} ({loc.display_name})")
+    return "Known locations: " + ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Live web tools helper (weather / time / crypto)
+# ---------------------------------------------------------------------------
+
+
+def _attach_live_context(
+    clean_text: str,
+    base_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Look at the cleaned user text and decide which live web tools to call.
+
+    - Weather questions   -> tools_web.get_weather_current(...)
+    - Time questions      -> tools_web.get_local_time(...)
+    - Bitcoin price       -> tools_web.get_crypto_price("bitcoin", "eur")
+
+    The result is stored under meta["live_context"] so generate.py can
+    pass it to the LLM via the META: {...} line in the user prompt.
+    """
+    meta: Dict[str, Any] = dict(base_meta or {})
+    text = clean_text.lower()
+
+    live: Dict[str, Any] = {}
+
+    # Weather triggers
+    weather_triggers = [
+        "weather",
+        "temperature outside",
+        "outside weather",
+        "cold outside",
+        "hot outside",
+        "rain outside",
+        "snow outside",
+        "forecast",
+    ]
+    if any(trig in text for trig in weather_triggers):
+        # Kuopio approx coordinates (Savonia region)
+        weather = tools_web.get_weather_current(62.89, 27.68)
+        if weather is not None:
+            live["weather"] = weather
+
+    # Local time triggers
+    time_triggers = [
+        "what time is it",
+        "current time",
+        "time now",
+        "time in helsinki",
+        "local time",
+    ]
+    if any(trig in text for trig in time_triggers):
+        live["time"] = tools_web.get_local_time("Europe/Helsinki")
+
+    # Crypto price triggers (BTC/EUR)
+    crypto_triggers = [
+        "bitcoin",
+        "btc",
+        "btc/eur",
+        "btc price",
+        "bitcoin price",
+    ]
+    if any(trig in text for trig in crypto_triggers):
+        btc = tools_web.get_crypto_price("bitcoin", "eur")
+        if btc is not None:
+            live.setdefault("crypto", {})["btc_eur"] = btc
+
+    # Only add live_context if we actually have something
+    if live:
+        meta["live_context"] = live
+
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# JSON extraction from model output
+# ---------------------------------------------------------------------------
+
+
+def _extract_final_json_block(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract the last JSON object from the model's raw text output.
+
+    We assume the model ends with something like:
+        {
+          "reply_text": "...",
+          "intent": "NAVIGATE",
+          "nav_goal": "A201"
+        }
+    """
+    if not text:
         return None
 
+    end = text.rfind("}")
+    if end == -1:
+        return None
 
-def _parse_model_output(
-    result: ModelCallResult,
-    intent_hint: IntentType,
-    nav_goal_guess: Optional[str],
-) -> ParsedJsonResult:
+    start = text.rfind("{", 0, end)
+    if start == -1:
+        return None
+
+    candidate = text[start : end + 1]
+    try:
+        obj = json.loads(candidate)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Core pipeline
+# ---------------------------------------------------------------------------
+
+
+async def run_pipeline(chat_req: ChatRequest) -> ChatResponse:
     """
-    Take ModelCallResult (text + tier info) and extract:
+    Main entry point for handling a single chat request.
 
-    - reply_text : what TTS should speak
-    - intent     : STOP/FOLLOW/NAVIGATE/STATUS/CHATBOT (string)
-    - nav_goal   : canonical goal or None
-    - used_tier  : tier1 / tier2 / tier3
-    - parse_error: None or error string
+    Steps:
+    1. Resolve session_id and load conversation history.
+    2. Sanitize user text.
+    3. Classify intent (STOP/FOLLOW/NAVIGATE/STATUS/CHATBOT).
+    4. Resolve canonical nav_goal using map_lookup (if navigation-related).
+    5. Load live telemetry (NavState + RobotStatus) and locations summary.
+    6. Attach live web context (weather / time / BTC) into meta.
+    7. Build a new ChatRequest with enriched .meta and cleaned text.
+    8. Call generate.generate_reply_text(...) (Tier1/Tier2/Tier3).
+    9. Extract final JSON block from model output.
+    10. Combine deterministic intent/nav_goal with model JSON.
+    11. Update runtime session state and return ChatResponse.
     """
-    raw_text: str = result.text or ""
-    used_tier: str = result.used_tier
+    # ------------------------------------------------------------------
+    # 1) Resolve session_id and load conversation history
+    # ------------------------------------------------------------------
+    # Prefer explicit field; fall back to legacy meta["session_id"]; else "default".
+    session_id: str = (
+        chat_req.session_id
+        or (
+            chat_req.meta.get("session_id")
+            if isinstance(chat_req.meta, dict)
+            else None
+        )
+        or "default"
+    )
 
-    json_obj = _extract_json_suffix(raw_text)
-    if not json_obj:
-        # No valid JSON block → fall back to simple behavior:
-        return ParsedJsonResult(
-            reply_text=raw_text.strip()[: settings.max_reply_chars],
-            intent=intent_hint,
-            nav_goal=nav_goal_guess,
-            used_tier=used_tier,
-            parse_error="json_missing_or_invalid",
+    # Pull recent history to feed into the model via meta if needed.
+    history_messages: List[Dict[str, str]] = session_store.get_history_as_messages(
+        session_id
+    )
+
+    # ------------------------------------------------------------------
+    # 2) Sanitize user text using safety.SanitizedTextResult
+    # ------------------------------------------------------------------
+    raw_text = chat_req.user_text or ""
+
+    try:
+        res = safety.sanitize_user_text(raw_text)
+    except Exception:  # noqa: BLE001
+        logger.exception("sanitize_user_text failed; falling back to raw_text.")
+        # Fallback behaviour: treat raw_text as already clean
+        from app.core.safety import SanitizedTextResult  # local import to avoid cycle
+
+        res = SanitizedTextResult(
+            original=str(raw_text),
+            sanitized=str(raw_text),
+            truncated=False,
+            too_short=(not str(raw_text).strip()),
         )
 
-    # Extract fields from JSON with safe defaults
-    reply_text = str(json_obj.get("reply_text") or "").strip()
-    intent = str(json_obj.get("intent") or intent_hint).strip().upper()
-    nav_goal = json_obj.get("nav_goal", nav_goal_guess)
+    clean_user_text = res.sanitized
 
-    if not reply_text:
-        # If JSON didn't provide reply_text, fall back to full text
-        reply_text = raw_text.strip()
+    # ------------------------------------------------------------------
+    # 3) Deterministic intent classification
+    # ------------------------------------------------------------------
+    intent: str = classify_intent(clean_user_text)
 
-    # Trim reply_text for safety
-    reply_text = reply_text[: settings.max_reply_chars]
+    # ------------------------------------------------------------------
+    # 4) Resolve nav_goal using location model (if nav-related)
+    # ------------------------------------------------------------------
+    canonical_nav_goal: Optional[str] = None
+    rough_goal: Optional[str] = None
 
-    # Normalize intent to one of our known labels; otherwise fall back.
-    valid_intents = {"STOP", "FOLLOW", "NAVIGATE", "STATUS", "CHATBOT"}
-    if intent not in valid_intents:
-        intent = intent_hint
+    if is_nav_intent(intent):
+        # Rough phrase from the sentence (e.g. "A201", "info desk")
+        rough_goal = extract_nav_goal(clean_user_text)
+        # Map that phrase to canonical location if possible
+        if rough_goal:
+            canonical_nav_goal = resolve_nav_goal(rough_goal)
+        # As extra fallback, try using the whole text
+        if canonical_nav_goal is None:
+            canonical_nav_goal = resolve_nav_goal(clean_user_text)
 
-    # If model returned null/None for nav_goal, keep the original guess.
-    if nav_goal is None:
-        nav_goal = nav_goal_guess
+    # ------------------------------------------------------------------
+    # 5) Load live telemetry + locations summary
+    # ------------------------------------------------------------------
+    nav_state_meta = _load_nav_state_for_meta()
+    robot_status_meta = _load_robot_status_for_meta()
+    locations_summary = _build_locations_summary()
 
-    # If nav_goal is a string, normalize spacing a bit.
-    if isinstance(nav_goal, str):
-        nav_goal = nav_goal.strip()
-        if not nav_goal:
-            nav_goal = None
+    # ------------------------------------------------------------------
+    # 6) Attach live web context and other meta
+    # ------------------------------------------------------------------
+    # Start from client meta and enrich with live tools.
+    base_meta = dict(chat_req.meta or {})
+    # Ensure session_id is always present in meta for downstream logging/prompts.
+    base_meta["session_id"] = session_id
 
-    return ParsedJsonResult(
-        reply_text=reply_text,
-        intent=intent,  # still string here; ChatResponse will coerce
-        nav_goal=nav_goal,
-        used_tier=used_tier,
-        parse_error=None,
+    meta_with_live = _attach_live_context(clean_user_text, base_meta)
+
+    # Attach telemetry + locations + canonical goal
+    meta_with_live["nav_state"] = nav_state_meta
+    meta_with_live["robot_status"] = robot_status_meta
+    if locations_summary:
+        meta_with_live["locations_summary"] = locations_summary
+    if canonical_nav_goal:
+        meta_with_live["canonical_nav_goal"] = canonical_nav_goal
+
+    # Telemetry flags so prompts can see if data is real or missing.
+    meta_with_live["telemetry_flags"] = {
+        "has_nav_state": bool(nav_state_meta),
+        "has_robot_status": bool(robot_status_meta),
+    }
+
+    # Attach recent conversation history as optional context.
+    # generate.py can decide how to use this (or ignore it).
+    if history_messages:
+        meta_with_live["conversation_history"] = history_messages
+
+    # Debug-only: show just the keys so logs are not spammy.
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "[Robot Savo PIPELINE] META keys sent to LLM: %s",
+            list(meta_with_live.keys()),
+        )
+
+    # ------------------------------------------------------------------
+    # 7) Build a new ChatRequest with enriched meta and cleaned text
+    # ------------------------------------------------------------------
+    enriched_request = ChatRequest(
+        user_text=clean_user_text,
+        source=chat_req.source,
+        language=chat_req.language,
+        session_id=session_id,
+        meta=meta_with_live,
     )
 
-
-# ---------------------------------------------------------------------------
-# Live data integration (tools_web)
-# ---------------------------------------------------------------------------
-
-def _attach_live_context(request: ChatRequest) -> None:
-    """
-    Detect if the user is asking about live info (weather, time, crypto),
-    call tools_web, and inject results into request.meta["live_context"].
-
-    This function mutates `request` in-place.
-    """
-    text = (request.user_text or "").lower()
-    live_context: Dict[str, Any] = {}
-
-    # Example: simple keyword-based routing.
-    # You can make this smarter later.
-    try:
-        if "weather" in text or "temperature" in text:
-            # Kuopio approx; later you can take this from robot config or Pi.
-            live_context["weather"] = get_weather_current(
-                lat=62.89,
-                lon=27.68,
-            )
-    except ToolsWebError as exc:
-        logger.warning("Weather tool failed: %s", exc)
-
-    try:
-        if "time" in text and "battery" not in text:
-            live_context["time"] = get_local_time()
-    except ToolsWebError as exc:
-        logger.warning("Time tool failed: %s", exc)
-
-    try:
-        if any(k in text for k in ("bitcoin", "btc", "crypto", "cryptocurrency")):
-            price = get_crypto_price("bitcoin", "eur")
-            if price is not None:
-                live_context["crypto"] = {"btc_eur": price}
-    except ToolsWebError as exc:
-        logger.warning("Crypto tool failed: %s", exc)
-
-    if not live_context:
-        return
-
-    meta = dict(request.meta or {})
-    meta["live_context"] = live_context
-    request.meta = meta
-
-
-# ---------------------------------------------------------------------------
-# Public pipeline function
-# ---------------------------------------------------------------------------
-
-def run_pipeline(
-    request: ChatRequest,
-    context: Optional[Dict[str, Any]] = None,
-) -> ChatResponse:
-    """
-    High-level entry point used by /chat.
-
-    - Classifies intent.
-    - Optionally attaches live data into request.meta["live_context"].
-    - Runs generation chain (Tier1/Tier2/Tier3).
-    - Parses JSON block from model output.
-    - Returns ChatResponse for FastAPI.
-    """
-    context = context or {}
-
-    user_text = request.user_text or ""
-    intent: IntentType = classify_intent(user_text)
-
-    # Simple nav goal guess from text (string like "a201" or "info desk").
-    nav_goal_guess = extract_nav_goal(user_text) if intent in ("NAVIGATE", "FOLLOW") else None
-
-    # 1) Attach live data (only for CHATBOT-style questions, typically)
-    if intent == "CHATBOT":
-        _attach_live_context(request)
-
-    # 2) Run generation chain
-    model_result: ModelCallResult = generate_reply_text(
-        request=request,
+    # ------------------------------------------------------------------
+    # 8) Call Tier1/Tier2/Tier3 via generate_reply_text(...)
+    # ------------------------------------------------------------------
+    nav_goal_hint = canonical_nav_goal or rough_goal
+    result: ModelCallResult = generate_reply_text(
+        request=enriched_request,
         intent=intent,
-        nav_goal_guess=nav_goal_guess,
+        nav_goal_guess=nav_goal_hint,
     )
 
-    # 3) Parse JSON block from model output
-    parsed: ParsedJsonResult = _parse_model_output(
-        result=model_result,
-        intent_hint=intent,
-        nav_goal_guess=nav_goal_guess,
+    model_output: str = result.text
+    logger.info(
+        "[Robot Savo PIPELINE] used_tier=%s backend=%r",
+        result.used_tier,
+        result.raw,
     )
 
-    # 4) Convert intent string → ChatResponse.IntentType enum
+    # ------------------------------------------------------------------
+    # 9) Extract final JSON block from model output
+    # ------------------------------------------------------------------
+    parsed: Dict[str, Any] = {}
+    json_obj = _extract_final_json_block(model_output)
+    if json_obj is not None:
+        parsed = json_obj
+    else:
+        logger.warning("No valid JSON block found in model output; using fallback.")
+
+    # ------------------------------------------------------------------
+    # 10) Combine deterministic intent/nav_goal with model JSON
+    # ------------------------------------------------------------------
+    reply_text = parsed.get("reply_text") or parsed.get("reply") or ""
+
+    model_intent = parsed.get("intent")
+    model_nav_goal = parsed.get("nav_goal")
+
+    # Intent: deterministic classifier wins, log if model disagrees
+    final_intent = intent
+    if model_intent and model_intent != intent:
+        logger.info(
+            "Model intent (%s) differs from classified intent (%s); "
+            "keeping classifier result.",
+            model_intent,
+            intent,
+        )
+
+    # nav_goal: prefer canonical; otherwise allow model's suggestion
+    final_nav_goal: Optional[str] = canonical_nav_goal or model_nav_goal
+
+    # Only keep nav_goal when the intent is navigation-related.
+    # For CHATBOT / STATUS (pure explanation) we force nav_goal=None so that
+    # Pi does not accidentally think a new navigation target was requested.
+    if not is_nav_intent(final_intent):
+        final_nav_goal = None
+
+    # ------------------------------------------------------------------
+    # 11) Clamp reply length, update session state, and build ChatResponse
+    # ------------------------------------------------------------------
+    # clamp_reply_text() already uses settings.max_reply_chars
+    reply_text = safety.clamp_reply_text(reply_text)
+
+    # Update runtime session store (best-effort; failures should not break reply).
     try:
-        response_intent = ResponseIntentType(parsed.intent)
-    except ValueError:
-        response_intent = ResponseIntentType.CHATBOT
+        session_store.update_from_interaction(
+            session_id=session_id,
+            user_text=clean_user_text,
+            assistant_text=reply_text,
+            intent=final_intent,
+            nav_goal=final_nav_goal,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "[Robot Savo PIPELINE] Failed to update session store for %s",
+            session_id,
+        )
 
-    # 5) Build final ChatResponse
+    # ChatResponse.intent expects Enum, but Pydantic will coerce from string.
     response = ChatResponse(
-        reply_text=parsed.reply_text,
-        intent=response_intent,
-        nav_goal=parsed.nav_goal,
-    )
-
-    logger.debug(
-        "run_pipeline: intent=%s nav_goal=%r used_tier=%s live_keys=%s",
-        parsed.intent,
-        parsed.nav_goal,
-        parsed.used_tier,
-        list((request.meta or {}).get("live_context", {}).keys()),
+        reply_text=reply_text,
+        intent=final_intent,      # e.g. "NAVIGATE"
+        nav_goal=final_nav_goal,  # e.g. "A201" or "Info Desk" or None
+        session_id=session_id,
+        tier_used=result.used_tier,
     )
     return response
 
@@ -248,23 +470,36 @@ def run_pipeline(
 # Self-test
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
 
-    from app.models.chat_request import InputSource
+async def _self_test() -> int:
+    """
+    Simple self-test for the pipeline.
 
-    print("Robot Savo — pipeline.py self-test\n")
+    This will actually call generate.py (Tier1/Tier2/Tier3), so make sure
+    .env and models are configured before running.
+    """
+    print("Robot Savo — pipeline.py self-test")
+    print("----------------------------------")
 
-    # Fake navigation request
-    req = ChatRequest(
-        user_text="Can you take me to info deskS?",
-        source=InputSource.KEYBOARD,
-        language="en",
-        meta={"session_id": "demo-002"},
+    dummy_req = ChatRequest(
+        user_text="Can you take me to room A201?",
+        session_id="pipeline-self-test",
+        meta={"client": "self-test"},
     )
 
-    resp = run_pipeline(req, context={})
-
+    resp = await run_pipeline(dummy_req)
     print("ChatResponse:")
-    print(f"  reply_text : {resp.reply_text!r}")
-    print(f"  intent     : {resp.intent!r}")
-    print(f"  nav_goal   : {resp.nav_goal!r}")
+    try:
+        print(resp.model_dump(mode="json", exclude_none=True))
+    except AttributeError:
+        # Pydantic v1 fallback
+        print(resp.dict(exclude_none=True))
+
+    print("\nSelf-test OK.")
+    return 0
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    raise SystemExit(asyncio.run(_self_test()))

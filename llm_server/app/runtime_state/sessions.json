@@ -1,0 +1,44 @@
+{
+  "sessions": {
+    "default": {
+      "session_id": "default",
+      "created_at": "2025-11-23T01:09:08.955066Z",
+      "last_seen": "2025-11-23T02:04:23.086712Z",
+      "last_intent": "CHATBOT",
+      "last_nav_goal": null,
+      "history": [
+        {
+          "role": "user",
+          "text": "hi how do you do",
+          "ts": "2025-11-23T01:09:08.955191Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Hi! I am Robot Savo, a small guide robot. I am doing well, thank you. Right now I am in a test console.",
+          "ts": "2025-11-23T01:09:08.955191Z"
+        },
+        {
+          "role": "user",
+          "text": "who are you, what are you duties?",
+          "ts": "2025-11-23T01:09:39.987592Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I am Robot Savo, a small indoor guide robot. My duties are to guide people to rooms like A201 or Info Desk, and follow them safely. In this test console, I cannot really move.",
+          "ts": "2025-11-23T01:09:39.987592Z"
+        },
+        {
+          "role": "user",
+          "text": "hi how are you? my friend got an acccident in finland so what to do",
+          "ts": "2025-11-23T02:04:23.086712Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Hi! I am doing well, thank you. I am very sorry about your friend. Please call 112 for emergency help in Finland right now. I cannot give medical advice.",
+          "ts": "2025-11-23T02:04:23.086712Z"
+        }
+      ],
+      "summary": null
+    }
+  }
+}
