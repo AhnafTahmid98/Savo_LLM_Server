@@ -10,7 +10,10 @@ Features:
 - Sends ChatRequest-shaped JSON to /ws/chat.
 - Reads ChatResponse-shaped JSON back.
 - Adds optional meta: session_id, dev_mode.
-- AUTO-RECONNECT when the connection drops (fixed small delay).
+- AUTO-RECONNECT when the connection drops (with backoff).
+- NEW: If the connection drops after sending a question but before
+  receiving the answer, the client will remember that question and
+  automatically resend it after reconnect. You do NOT need to type it again.
 
 This client is meant for development / testing on your laptop.
 The Pi will normally call the HTTP /chat endpoint instead.
@@ -22,7 +25,7 @@ import argparse
 import asyncio
 import json
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import websockets
 from websockets.exceptions import (
@@ -32,6 +35,25 @@ from websockets.exceptions import (
 )
 
 DEFAULT_SERVER = "ws://127.0.0.1:8000/ws/chat"
+
+
+# ---------------------------------------------------------------------------
+# Custom exception to carry a "pending" message across reconnects
+# ---------------------------------------------------------------------------
+
+
+class PendingMessage(Exception):
+    """
+    Raised when the connection drops while we are waiting for a reply
+    to a message that was already sent.
+
+    The `payload` attribute holds the ChatRequest-shaped dict that
+    should be resent after reconnect.
+    """
+
+    def __init__(self, payload: Dict[str, Any]) -> None:
+        super().__init__("Connection lost with a pending message.")
+        self.payload = payload
 
 
 # ---------------------------------------------------------------------------
@@ -92,12 +114,6 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable dev_mode flag in meta.",
     )
-    parser.add_argument(
-        "--reconnect-delay",
-        type=float,
-        default=3.0,
-        help="Fixed delay (seconds) before reconnect after a drop (default: 3.0).",
-    )
     return parser.parse_args()
 
 
@@ -146,11 +162,20 @@ def build_payload(text: str, args: argparse.Namespace) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def run_single_session(args: argparse.Namespace) -> None:
+async def run_single_session(
+    args: argparse.Namespace,
+    pending_payload: Optional[Dict[str, Any]] = None,
+) -> None:
     """
     Handles one connect→chat→disconnect cycle.
 
-    Called inside an outer auto-reconnect loop.
+    If `pending_payload` is provided, it will be resent immediately after
+    connecting, and we will wait for its reply before entering the normal
+    REPL loop.
+
+    If the connection drops AFTER we send a payload but BEFORE we receive
+    the reply, we raise PendingMessage(payload) so the outer loop can
+    reconnect and resend it.
     """
     print("Type a message and press Enter. Type /quit to exit.\n")
     print(f"[client] server   : {args.server}")
@@ -161,7 +186,7 @@ async def run_single_session(args: argparse.Namespace) -> None:
 
     # IMPORTANT:
     # - ping_interval=None, ping_timeout=None disables client keepalive pings.
-    #   This avoids client-side "keepalive ping timeout" when the server is busy.
+    #   This avoids client-side "keepalive ping timeout" if the server is busy.
     async with websockets.connect(
         args.server,
         ping_interval=None,
@@ -169,6 +194,55 @@ async def run_single_session(args: argparse.Namespace) -> None:
     ) as ws:
         print("Connected.\n")
 
+        # --------------------------------------------------------------
+        # 1) If we had a pending message from a previous connection,
+        #    resend it immediately and wait for the answer.
+        # --------------------------------------------------------------
+        if pending_payload is not None:
+            print(
+                "[client] Re-sending last unanswered message after reconnect...\n"
+            )
+            # Send the old payload again
+            await ws.send(json.dumps(pending_payload))
+
+            try:
+                raw = await ws.recv()
+            except (ConnectionClosed, ConnectionClosedError, ConnectionClosedOK) as exc:
+                print(
+                    "\nConnection dropped again while waiting for the "
+                    "pending reply."
+                )
+                # Still pending → propagate so outer loop keeps it.
+                raise PendingMessage(pending_payload) from exc
+
+            # Got a reply for the pending message: parse and show it.
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                print(f"Raw response (not JSON) for pending message: {raw}")
+            else:
+                if isinstance(data, dict) and data.get("type") == "error":
+                    print(
+                        f"Server error (pending message): "
+                        f"{data.get('code')} - {data.get('message')}"
+                    )
+                    details = data.get("details")
+                    if details:
+                        print(f"  details: {details}")
+                    print()
+                else:
+                    reply_text = data.get("reply_text")
+                    intent = data.get("intent")
+                    nav_goal = data.get("nav_goal")
+                    print("Robot Savo (pending reply):", reply_text)
+                    print(f"  intent = {intent}, nav_goal = {nav_goal}\n")
+
+            # Pending payload has now been answered; clear it.
+            pending_payload = None
+
+        # --------------------------------------------------------------
+        # 2) Normal REPL loop
+        # --------------------------------------------------------------
         while True:
             try:
                 text = input("You: ").strip()
@@ -183,6 +257,8 @@ async def run_single_session(args: argparse.Namespace) -> None:
                 raise KeyboardInterrupt
 
             payload = build_payload(text, args)
+            # Mark this payload as "in flight" until we get a reply.
+            in_flight_payload: Dict[str, Any] = payload
 
             # Send ChatRequest
             await ws.send(json.dumps(payload))
@@ -191,9 +267,16 @@ async def run_single_session(args: argparse.Namespace) -> None:
             try:
                 raw = await ws.recv()
             except (ConnectionClosed, ConnectionClosedError, ConnectionClosedOK) as exc:
-                print(f"\nConnection dropped while waiting for reply: {exc}")
-                # Re-raise so outer loop can auto-reconnect.
-                raise
+                print(
+                    "\nConnection dropped while waiting for reply. "
+                    "Your last question will be resent after reconnect."
+                )
+                # Raise PendingMessage so the outer loop can reconnect
+                # and resend this exact payload.
+                raise PendingMessage(in_flight_payload) from exc
+
+            # Reached here → we got a reply, so nothing is pending.
+            in_flight_payload = {}
 
             # Try to parse JSON
             try:
@@ -232,31 +315,51 @@ async def run_with_reconnect(args: argparse.Namespace) -> None:
     Behaviour:
     - Tries to connect and run_single_session().
     - On error/disconnect, waits a bit and retries.
-    - Fixed delay (default 3s) between reconnect attempts.
+    - If the error was a PendingMessage, we store its payload and resend
+      that message first after reconnect.
+    - Backoff: 3s, 6s, 9s, ... capped at 30s.
     - Ctrl+C at any time to exit.
     """
     attempt = 0
-    delay = max(float(args.reconnect_delay), 0.5)  # guard: at least 0.5s
+    base_delay = 3  # seconds
+    pending_payload: Optional[Dict[str, Any]] = None
 
     while True:
         attempt += 1
         try:
             print(f"Connecting to '{args.server}' (attempt {attempt}) ...")
-            await run_single_session(args)
+            await run_single_session(args, pending_payload=pending_payload)
             # If run_single_session returns normally (user /quit),
             # we exit the reconnect loop.
             return
+
         except KeyboardInterrupt:
             print("\nInterrupted. Bye.")
             return
+
+        except PendingMessage as exc:
+            # Keep the payload so we can resend it after reconnect.
+            pending_payload = exc.payload
+            print(
+                "\n[client] Connection closed with a pending question. "
+                "Will resend it after reconnect."
+            )
+
         except (ConnectionClosed, ConnectionClosedError, ConnectionClosedOK) as exc:
+            # Generic close without a known pending message; nothing to resend.
+            pending_payload = None
             print(f"\nConnection closed: {exc}")
+
         except OSError as exc:
+            pending_payload = None
             print(f"\nConnection error: {exc}")
+
         except Exception as exc:  # noqa: BLE001
+            pending_payload = None
             print(f"\nUnexpected error: {exc}")
 
-        # Auto-reconnect with fixed delay
+        # Auto-reconnect delay
+        delay = min(base_delay * attempt, 30)
         print(f"Reconnecting in {delay} seconds... (Ctrl+C to stop)")
         try:
             await asyncio.sleep(delay)

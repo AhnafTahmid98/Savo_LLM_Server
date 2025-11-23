@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  llm_server:
+    # Build image from your Dockerfile in this folder
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: robot_savo_llm:latest
+    container_name: robot_savo_llm
+
+    restart: unless-stopped
+
+    # Load secrets + config (OpenRouter key, Ollama URL, etc.)
+    env_file:
+      - .env
+
+    # Expose API on host port 8000 -> container port 8000
+    ports:
+      - "8000:8000"
+
+    # Keep runtime JSON + logs on host, not inside container
+    volumes:
+      # sessions.json lives here
+      - ./app/runtime_state:/app/app/runtime_state
+      # nav_state.json, robot_status.json, known_locations.json
+      - ./app/map_data:/app/app/map_data
+      # optional: store server logs on host
+      - ./logs:/app/logs
+
+    # Simple healthcheck hitting /health endpoint in your FastAPI app
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    networks:
+      - robot_savo_net
+
+networks:
+  robot_savo_net:
+    driver: bridge
