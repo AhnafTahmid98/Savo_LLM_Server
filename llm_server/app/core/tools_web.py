@@ -6,7 +6,7 @@ Robot Savo LLM Server — Web Tools
 Small helper functions for **live external data** that the LLM can use:
 - Weather (Open-Meteo)
 - Local time (worldtimeapi.org with safe fallback)
-- Crypto prices (CoinGecko, e.g. BTC/EUR)
+- Crypto prices (CoinGecko; limited, safe allow-list of coins/fiats)
 
 This module is used by:
 - app/core/pipeline.py  (via _attach_live_context)
@@ -15,6 +15,8 @@ Design:
 - Each helper is pure: input params -> small dict or None.
 - Any network/JSON problems raise ToolsWebError OR return None (for
   non-critical data) so the robot can still answer safely.
+- Crypto helpers use explicit allow-lists (BTC/ETH/DOGE/LINK, EUR/USD)
+  so the LLM cannot "invent" unknown symbols or random coins.
 """
 
 from __future__ import annotations
@@ -33,10 +35,74 @@ class ToolsWebError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Crypto symbol / fiat allow-lists
+# ---------------------------------------------------------------------------
+
+# Map short symbols and aliases -> CoinGecko IDs
+COIN_ID_MAP: Dict[str, str] = {
+    # Bitcoin
+    "btc": "bitcoin",
+    "xbt": "bitcoin",
+    "bitcoin": "bitcoin",
+    # Ethereum
+    "eth": "ethereum",
+    "ethereum": "ethereum",
+    # Dogecoin
+    "doge": "dogecoin",
+    "dogecoin": "dogecoin",
+    # Chainlink
+    "link": "chainlink",
+    "chainlink": "chainlink",
+}
+
+# Map various fiat notations -> CoinGecko vs_currency codes
+FIAT_MAP: Dict[str, str] = {
+    "eur": "eur",
+    "€": "eur",
+    "euro": "eur",
+    "usd": "usd",
+    "$": "usd",
+    "dollar": "usd",
+}
+
+
+def _resolve_coin_id(symbol: str) -> Optional[str]:
+    """
+    Resolve a user-facing symbol/alias (e.g. 'btc', 'Bitcoin') to
+    a CoinGecko coin id (e.g. 'bitcoin').
+
+    Returns None if the symbol is not in the allow-list.
+    """
+    key = symbol.strip().lower()
+    coin_id = COIN_ID_MAP.get(key)
+    if coin_id is None:
+        logger.warning("Unknown coin symbol requested: %r", symbol)
+    return coin_id
+
+
+def _resolve_fiat_code(code: str) -> Optional[str]:
+    """
+    Resolve a user-facing fiat notation (e.g. 'eur', '€', 'usd', '$')
+    to a CoinGecko vs_currency code ('eur', 'usd').
+
+    Returns None if the fiat is not in the allow-list.
+    """
+    key = code.strip().lower()
+    fiat = FIAT_MAP.get(key)
+    if fiat is None:
+        logger.warning("Unknown fiat currency requested: %r", code)
+    return fiat
+
+
+# ---------------------------------------------------------------------------
 # Internal HTTP helper
 # ---------------------------------------------------------------------------
 
-def _safe_get_json(url: str, params: Optional[Dict[str, Any]] = None, timeout: float = 5.0) -> Dict[str, Any]:
+def _safe_get_json(
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = 5.0,
+) -> Dict[str, Any]:
     """
     Tiny wrapper around requests.get that:
     - logs errors
@@ -86,7 +152,10 @@ def get_weather_current(lat: float, lon: float) -> Optional[Dict[str, Any]]:
     params = {
         "latitude": lat,
         "longitude": lon,
-        "current": "temperature_2m,weathercode,windspeed_10m,winddirection_10m,is_day",
+        "current": (
+            "temperature_2m,weathercode,"
+            "windspeed_10m,winddirection_10m,is_day"
+        ),
         "timezone": "auto",
     }
 
@@ -134,7 +203,8 @@ def get_local_time(timezone: str = "Europe/Helsinki") -> Dict[str, Any]:
         # Fallback: system time (always available, no network)
         now = _dt.datetime.now(_dt.timezone.utc).astimezone()
         logger.warning(
-            "get_local_time: failed (%s), falling back to system time.", exc
+            "get_local_time: failed (%s), falling back to system time.",
+            exc,
         )
         return {
             "datetime": now.isoformat(),
@@ -143,26 +213,64 @@ def get_local_time(timezone: str = "Europe/Helsinki") -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Crypto price (CoinGecko)
+# Crypto price (CoinGecko, with allow-lists)
 # ---------------------------------------------------------------------------
 
-def get_crypto_price(symbol: str = "bitcoin", vs_currency: str = "eur") -> Optional[Dict[str, Any]]:
+def get_crypto_price(
+    symbol: str = "bitcoin",
+    vs_currency: str = "eur",
+    use_aliases: bool = True,
+) -> Optional[Dict[str, Any]]:
     """
     Get a simple crypto price using the free CoinGecko API.
 
-    Example return (BTC/EUR):
-        {
-            "symbol": "bitcoin",
-            "vs_currency": "eur",
-            "price": 73123.0
-        }
+    Parameters
+    ----------
+    symbol:
+        User-facing coin symbol or CoinGecko id. If `use_aliases` is True,
+        we resolve things like "btc"/"Bitcoin" -> "bitcoin" using COIN_ID_MAP.
+    vs_currency:
+        User-facing fiat code or CoinGecko vs_currency. If `use_aliases`
+        is True, we resolve things like "€"/"usd"/"$" -> "eur"/"usd".
+    use_aliases:
+        If True (default), apply the allow-lists COIN_ID_MAP and FIAT_MAP
+        to normalise the requested assets. If either cannot be resolved,
+        we log a warning and return None.
 
-    If the request fails or JSON shape is unexpected, returns None.
+    Returns
+    -------
+    Optional[Dict[str, Any]]
+        Example for BTC/EUR:
+            {
+                "symbol": "bitcoin",
+                "vs_currency": "eur",
+                "price": 73123.0
+            }
+
+        Returns None if:
+        - the asset/fiat is not in the allow-list (with use_aliases=True), or
+        - the HTTP/JSON request fails, or
+        - the JSON shape is unexpected.
     """
+    if use_aliases:
+        # Normalise coin symbol and fiat to our safe allow-lists.
+        norm_symbol = _resolve_coin_id(symbol)
+        if norm_symbol is None:
+            # Unknown coin: treat as unsupported.
+            return None
+        norm_vs = _resolve_fiat_code(vs_currency)
+        if norm_vs is None:
+            # Unknown fiat: treat as unsupported.
+            return None
+    else:
+        # Assume caller already passes valid CoinGecko ids/codes.
+        norm_symbol = symbol.strip().lower()
+        norm_vs = vs_currency.strip().lower()
+
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {
-        "ids": symbol,
-        "vs_currencies": vs_currency,
+        "ids": norm_symbol,
+        "vs_currencies": norm_vs,
     }
 
     try:
@@ -171,24 +279,34 @@ def get_crypto_price(symbol: str = "bitcoin", vs_currency: str = "eur") -> Optio
         return None
 
     try:
-        price = data.get(symbol, {}).get(vs_currency)
+        price = data.get(norm_symbol, {}).get(norm_vs)
     except AttributeError:
         logger.warning("CoinGecko unexpected JSON shape: %r", data)
         return None
 
     if price is None:
-        logger.warning("CoinGecko missing price for %s/%s: %r", symbol, vs_currency, data)
+        logger.warning(
+            "CoinGecko missing price for %s/%s: %r",
+            norm_symbol,
+            norm_vs,
+            data,
+        )
         return None
 
     try:
         price_f = float(price)
     except (TypeError, ValueError):
-        logger.warning("CoinGecko price not numeric for %s/%s: %r", symbol, vs_currency, price)
+        logger.warning(
+            "CoinGecko price not numeric for %s/%s: %r",
+            norm_symbol,
+            norm_vs,
+            price,
+        )
         return None
 
     return {
-        "symbol": symbol,
-        "vs_currency": vs_currency,
+        "symbol": norm_symbol,
+        "vs_currency": norm_vs,
         "price": price_f,
     }
 
@@ -219,7 +337,9 @@ if __name__ == "__main__":
     print("[Time] local:", t)
     print("-" * 60)
 
-    # 3) Crypto (BTC/EUR)
-    c = get_crypto_price("bitcoin", "eur")
-    print("[Crypto] BTC/EUR:", c["price"] if c else None)
+    # 3) Crypto (BTC/EUR, ETH/EUR, DOGE/EUR, LINK/EUR) via allow-list
+    for sym in ("btc", "eth", "doge", "link"):
+        c = get_crypto_price(sym, "eur")
+        print(f"[Crypto] {sym.upper()}/EUR:", c["price"] if c else None)
+
     print("\nSelf-test finished.")

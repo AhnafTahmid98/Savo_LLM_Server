@@ -10,7 +10,7 @@ Features:
 - Sends ChatRequest-shaped JSON to /ws/chat.
 - Reads ChatResponse-shaped JSON back.
 - Adds optional meta: session_id, dev_mode.
-- AUTO-RECONNECT when the connection drops (with backoff).
+- AUTO-RECONNECT when the connection drops (fixed small delay).
 
 This client is meant for development / testing on your laptop.
 The Pi will normally call the HTTP /chat endpoint instead.
@@ -92,6 +92,12 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable dev_mode flag in meta.",
     )
+    parser.add_argument(
+        "--reconnect-delay",
+        type=float,
+        default=3.0,
+        help="Fixed delay (seconds) before reconnect after a drop (default: 3.0).",
+    )
     return parser.parse_args()
 
 
@@ -155,7 +161,7 @@ async def run_single_session(args: argparse.Namespace) -> None:
 
     # IMPORTANT:
     # - ping_interval=None, ping_timeout=None disables client keepalive pings.
-    #   This avoids "keepalive ping timeout" when the server is busy with LLM.
+    #   This avoids client-side "keepalive ping timeout" when the server is busy.
     async with websockets.connect(
         args.server,
         ping_interval=None,
@@ -226,11 +232,11 @@ async def run_with_reconnect(args: argparse.Namespace) -> None:
     Behaviour:
     - Tries to connect and run_single_session().
     - On error/disconnect, waits a bit and retries.
-    - Backoff: 3s, 6s, 9s, ... capped at 30s.
+    - Fixed delay (default 3s) between reconnect attempts.
     - Ctrl+C at any time to exit.
     """
     attempt = 0
-    base_delay = 3  # seconds
+    delay = max(float(args.reconnect_delay), 0.5)  # guard: at least 0.5s
 
     while True:
         attempt += 1
@@ -250,8 +256,7 @@ async def run_with_reconnect(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"\nUnexpected error: {exc}")
 
-        # Auto-reconnect delay
-        delay = min(base_delay * attempt, 30)
+        # Auto-reconnect with fixed delay
         print(f"Reconnecting in {delay} seconds... (Ctrl+C to stop)")
         try:
             await asyncio.sleep(delay)

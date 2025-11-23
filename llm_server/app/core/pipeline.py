@@ -14,7 +14,7 @@ This version:
     - NavState     (nav_state.json)
     - RobotStatus  (robot_status.json)
 - Attaches a locations summary (known locations).
-- Attaches live web context (weather / time / BTC) via tools_web.
+- Attaches live web context (weather / local time / crypto prices) via tools_web.
 - Injects all of this into ChatRequest.meta so generate.py can see it.
 - Calls generate.generate_reply_text(...) (3-tier chain).
 - Parses the final JSON block and returns ChatResponse.
@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from app.core.config import settings
 from app.core.intent import classify_intent, extract_nav_goal, is_nav_intent
@@ -147,7 +147,8 @@ def _attach_live_context(
 
     - Weather questions   -> tools_web.get_weather_current(...)
     - Time questions      -> tools_web.get_local_time(...)
-    - Bitcoin price       -> tools_web.get_crypto_price("bitcoin", "eur")
+    - Crypto questions    -> tools_web.get_crypto_price(...) for a small
+                             allow-list of coins/fiats (BTC/ETH/DOGE/LINK vs EUR/USD).
 
     The result is stored under meta["live_context"] so generate.py can
     pass it to the LLM via the META: {...} line in the user prompt.
@@ -157,7 +158,7 @@ def _attach_live_context(
 
     live: Dict[str, Any] = {}
 
-    # Weather triggers
+    # --- Weather triggers -------------------------------------------------
     weather_triggers = [
         "weather",
         "temperature outside",
@@ -174,7 +175,7 @@ def _attach_live_context(
         if weather is not None:
             live["weather"] = weather
 
-    # Local time triggers
+    # --- Local time triggers ---------------------------------------------
     time_triggers = [
         "what time is it",
         "current time",
@@ -185,18 +186,68 @@ def _attach_live_context(
     if any(trig in text for trig in time_triggers):
         live["time"] = tools_web.get_local_time("Europe/Helsinki")
 
-    # Crypto price triggers (BTC/EUR)
-    crypto_triggers = [
-        "bitcoin",
-        "btc",
-        "btc/eur",
-        "btc price",
-        "bitcoin price",
+    # --- Crypto price triggers (multi-coin, allow-listed) -----------------
+    # We support BTC, ETH, DOGE, LINK vs EUR/USD via tools_web.get_crypto_price.
+    crypto_coin_aliases: Dict[str, List[str]] = {
+        "btc": ["btc", "bitcoin", "xbt"],
+        "eth": ["eth", "ethereum"],
+        "doge": ["doge", "dogecoin"],
+        "link": ["link", "chainlink"],
+    }
+    crypto_generic_triggers = [
+        "crypto",
+        "coin price",
+        "coin prices",
+        "crypto price",
+        "crypto prices",
+        "cryptocurrency",
     ]
-    if any(trig in text for trig in crypto_triggers):
-        btc = tools_web.get_crypto_price("bitcoin", "eur")
-        if btc is not None:
-            live.setdefault("crypto", {})["btc_eur"] = btc
+    fiat_aliases: Dict[str, List[str]] = {
+        "eur": ["eur", "euro", "€"],
+        "usd": ["usd", "dollar", "dollars", "$", "us dollar", "us dollars"],
+    }
+
+    # Detect if the user is talking about crypto at all.
+    mentions_any_crypto = any(
+        alias in text for aliases in crypto_coin_aliases.values() for alias in aliases
+    ) or any(trig in text for trig in crypto_generic_triggers)
+
+    if mentions_any_crypto:
+        # Decide which fiat the user seems to care about (default EUR).
+        vs_currency = "eur"
+        for fiat_code, aliases in fiat_aliases.items():
+            if any(alias in text for alias in aliases):
+                vs_currency = fiat_code
+                break
+
+        # Collect which coins are explicitly requested.
+        coins_requested: Set[str] = set()
+        for coin_symbol, aliases in crypto_coin_aliases.items():
+            if any(alias in text for alias in aliases):
+                coins_requested.add(coin_symbol)
+
+        # If only generic "crypto" is mentioned, default to BTC.
+        if not coins_requested:
+            coins_requested.add("btc")
+
+        crypto_block: Dict[str, Any] = {}
+
+        for sym in sorted(coins_requested):
+            try:
+                info = tools_web.get_crypto_price(sym, vs_currency)
+            except Exception:  # noqa: BLE001
+                logger.exception("tools_web.get_crypto_price failed for %s/%s", sym, vs_currency)
+                info = None
+
+            if info is None:
+                # Either unsupported symbol/fiat or API issue.
+                continue
+
+            key = f"{info.get('symbol', sym)}_{info.get('vs_currency', vs_currency)}"
+            crypto_block[key] = info
+
+        if crypto_block:
+            live["crypto"] = crypto_block
 
     # Only add live_context if we actually have something
     if live:
@@ -258,7 +309,7 @@ async def run_pipeline(chat_req: ChatRequest) -> ChatResponse:
     3. Classify intent (STOP/FOLLOW/NAVIGATE/STATUS/CHATBOT).
     4. Resolve canonical nav_goal using map_lookup (if navigation-related).
     5. Load live telemetry (NavState + RobotStatus) and locations summary.
-    6. Attach live web context (weather / time / BTC) into meta.
+    6. Attach live web context (weather / time / crypto) into meta.
     7. Build a new ChatRequest with enriched .meta and cleaned text.
     8. Call generate.generate_reply_text(...) (Tier1/Tier2/Tier3).
     9. Extract final JSON block from model output.

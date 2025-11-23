@@ -39,6 +39,56 @@
         }
       ],
       "summary": null
+    },
+    "dev-01": {
+      "session_id": "dev-01",
+      "created_at": "2025-11-23T03:50:04.670890Z",
+      "last_seen": "2025-11-23T04:23:25.027753Z",
+      "last_intent": "CHATBOT",
+      "last_nav_goal": null,
+      "history": [
+        {
+          "role": "user",
+          "text": "grazie",
+          "ts": "2025-11-23T04:20:53.492391Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Prego! You're welcome. I like chatting in different languages.",
+          "ts": "2025-11-23T04:20:53.492391Z"
+        },
+        {
+          "role": "user",
+          "text": "how many languages you know",
+          "ts": "2025-11-23T04:21:14.295261Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I know several languages like English, Finnish, Italian, and more. I speak best in English.",
+          "ts": "2025-11-23T04:21:14.295261Z"
+        },
+        {
+          "role": "user",
+          "text": "but in total how many",
+          "ts": "2025-11-23T04:21:57.413883Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I know many languages a little, but no exact number. Like English, Finnish, Italian, Swedish, and more. I speak best in English.",
+          "ts": "2025-11-23T04:21:57.413883Z"
+        },
+        {
+          "role": "user",
+          "text": "bye",
+          "ts": "2025-11-23T04:23:25.027753Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Bye! Have a nice day. See you next time!",
+          "ts": "2025-11-23T04:23:25.027753Z"
+        }
+      ],
+      "summary": null
     }
   }
 }
