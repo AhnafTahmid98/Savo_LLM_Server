@@ -99,6 +99,186 @@
         }
       ],
       "summary": null
+    },
+    "robot_savo_pi": {
+      "session_id": "robot_savo_pi",
+      "created_at": "2025-11-24T02:06:12.088297Z",
+      "last_seen": "2025-11-26T05:41:50.129135Z",
+      "last_intent": "CHATBOT",
+      "last_nav_goal": "Info Desk",
+      "history": [
+        {
+          "role": "user",
+          "text": "Hey, Robert Sabo, can you hear me?",
+          "ts": "2025-11-26T01:44:16.284858Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Yes, I can hear you. I am Robot Savo. How can I help?",
+          "ts": "2025-11-26T01:44:16.284858Z"
+        },
+        {
+          "role": "user",
+          "text": "tell me about yourself who are you what is your duty what you do actually",
+          "ts": "2025-11-26T01:44:51.024265Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I am Robot Savo. I am a small guide robot in this building. I help people find rooms like A201 or the Info Desk. I guide safely or follow if you ask.",
+          "ts": "2025-11-26T01:44:51.024265Z"
+        },
+        {
+          "role": "user",
+          "text": "Okay, thank you for telling me and good day. Bye",
+          "ts": "2025-11-26T01:45:32.863698Z"
+        },
+        {
+          "role": "assistant",
+          "text": "You are welcome. Have a good day! Bye.",
+          "ts": "2025-11-26T01:45:32.863698Z"
+        },
+        {
+          "role": "user",
+          "text": "Hey Sabo, how is it going? Everything alright?",
+          "ts": "2025-11-26T05:41:50.129135Z"
+        },
+        {
+          "role": "assistant",
+          "text": "Hi Sabo! I am good. Everything is alright. How are you?",
+          "ts": "2025-11-26T05:41:50.129135Z"
+        }
+      ],
+      "summary": null
+    },
+    "debug-1": {
+      "session_id": "debug-1",
+      "created_at": "2025-11-24T02:16:10.904051Z",
+      "last_seen": "2025-11-24T02:16:10.904070Z",
+      "last_intent": "NAVIGATE",
+      "last_nav_goal": "A201",
+      "history": [
+        {
+          "role": "user",
+          "text": "Robot Savo, can you guide me to A201?",
+          "ts": "2025-11-24T02:16:10.904070Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I will guide you to A201. Please follow me and stay close behind me.",
+          "ts": "2025-11-24T02:16:10.904070Z"
+        }
+      ],
+      "summary": null
+    },
+    "pi-debug-1": {
+      "session_id": "pi-debug-1",
+      "created_at": "2025-11-24T02:29:00.622431Z",
+      "last_seen": "2025-11-24T02:29:00.622462Z",
+      "last_intent": "NAVIGATE",
+      "last_nav_goal": "A201",
+      "history": [
+        {
+          "role": "user",
+          "text": "Robot Savo, can you guide me to A201?",
+          "ts": "2025-11-24T02:29:00.622462Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I will guide you to A201. Please follow me and stay close behind me.",
+          "ts": "2025-11-24T02:29:00.622462Z"
+        }
+      ],
+      "summary": null
+    },
+    "ros2-robot_savo_pi": {
+      "session_id": "ros2-robot_savo_pi",
+      "created_at": "2025-11-24T02:33:11.217018Z",
+      "last_seen": "2025-11-24T02:42:14.377269Z",
+      "last_intent": "NAVIGATE",
+      "last_nav_goal": "A201",
+      "history": [
+        {
+          "role": "user",
+          "text": "Robot Savo, can you guide me to A201?",
+          "ts": "2025-11-24T02:33:11.217049Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I will guide you to A201. Please follow me and stay close behind me.",
+          "ts": "2025-11-24T02:33:11.217049Z"
+        },
+        {
+          "role": "user",
+          "text": "Robot Savo, can you guide me to A201?",
+          "ts": "2025-11-24T02:37:05.134868Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I will guide you to A201. Please follow me and stay close behind me.",
+          "ts": "2025-11-24T02:37:05.134868Z"
+        },
+        {
+          "role": "user",
+          "text": "Robot Savo, can you guide me to A201?",
+          "ts": "2025-11-24T02:42:14.377269Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I will guide you to A201. Please follow me and stay close behind me.",
+          "ts": "2025-11-24T02:42:14.377269Z"
+        }
+      ],
+      "summary": null
+    },
+    "robot_savo_pi-session": {
+      "session_id": "robot_savo_pi-session",
+      "created_at": "2025-11-24T02:55:09.743545Z",
+      "last_seen": "2025-11-24T03:19:18.513877Z",
+      "last_intent": "CHATBOT",
+      "last_nav_goal": "A201",
+      "history": [
+        {
+          "role": "user",
+          "text": "who are you, what is the weather today, what is the price of btc, what time it is now?",
+          "ts": "2025-11-24T03:07:41.034659Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I am Robot Savo. I help people find rooms in this building. Right now, it is about 3 degrees Celsius with light drizzle, wind at 16 km/h. Bitcoin is 75988 euros. The time is 05:00 UTC.",
+          "ts": "2025-11-24T03:07:41.034659Z"
+        },
+        {
+          "role": "user",
+          "text": "Robot Savo, can you guide me to A201?",
+          "ts": "2025-11-24T03:08:00.912853Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I will guide you to A201. Please follow me and stay close behind me.",
+          "ts": "2025-11-24T03:08:00.912853Z"
+        },
+        {
+          "role": "user",
+          "text": "Who are you, what is the weather today, what is the price of bitcoin, and what time is it now in Helsinki?",
+          "ts": "2025-11-24T03:18:49.563209Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I am Robot Savo. I help people find rooms in this building. Right now, it is about 3 degrees Celsius with light drizzle, wind at 16 km/h. Bitcoin is 75830 euros. The time now in Helsinki is 05:18.",
+          "ts": "2025-11-24T03:18:49.563209Z"
+        },
+        {
+          "role": "user",
+          "text": "Who are you, what is the weather today, what is the price of bitcoin?",
+          "ts": "2025-11-24T03:19:18.513877Z"
+        },
+        {
+          "role": "assistant",
+          "text": "I am Robot Savo. I help people find rooms in this building. Right now, it is about 3 degrees Celsius with light drizzle, wind at 16 km/h. Bitcoin is 75863 euros.",
+          "ts": "2025-11-24T03:19:18.513877Z"
+        }
+      ],
+      "summary": null
     }
   }
 }
